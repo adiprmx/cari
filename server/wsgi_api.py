@@ -26,7 +26,8 @@ Mesin pencari yang belajar sendiri:
   Pilar 4 — Web Mode / metasearch (v0.8+):
     * GET /web/search?q=... : cari di web lewat backend resmi tanpa API key:
       Wikipedia, DuckDuckGo Instant Answer, Hacker News (Algolia),
-      Stack Exchange — semuanya lolos whitelist outbound PythonAnywhere.
+      Stack Exchange, GitHub (user + repo) — semuanya lolos whitelist
+      outbound PythonAnywhere.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -57,7 +58,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -896,13 +897,57 @@ def _web_stackexchange(query: str) -> list[dict]:
     return out
 
 
-WEB_SOURCES = ["wikipedia", "duckduckgo", "hackernews", "stackexchange"]
+WEB_SOURCES = ["wikipedia", "duckduckgo", "hackernews", "stackexchange", "github"]
+
+
+def _web_github(query: str) -> list[dict]:
+    """GitHub user + repo search. Resmi, tanpa key (limit anonim 10 req/mnt)."""
+    out: list[dict] = []
+    try:
+        u = "https://api.github.com/search/users?" + urllib.parse.urlencode(
+            {"q": query, "per_page": 4})
+        d = _http_get_json(u)
+        for it in d.get("items", []):
+            if not it.get("html_url"):
+                continue
+            out.append({
+                "title": f"{it.get('login')} (GitHub)",
+                "url": it["html_url"],
+                "snippet": (it.get("bio") or "Profil GitHub") +
+                           f" · {it.get('public_repos', 0)} repo publik",
+                "source": "github"})
+        u = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
+            {"q": query, "per_page": 6, "sort": "stars", "order": "desc"})
+        d = _http_get_json(u)
+        for it in d.get("items", []):
+            if not it.get("html_url"):
+                continue
+            out.append({
+                "title": it.get("full_name", ""),
+                "url": it["html_url"],
+                "snippet": (it.get("description") or "Repositori GitHub") +
+                            f" · ★ {it.get('stargazers_count', 0)}",
+                "source": "github"})
+    except Exception:
+        pass
+    return out[:10]
 
 
 def _web_slug(url: str) -> str:
     s = re.sub(r"^https?://(www\.)?", "", url.strip().lower())
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s[:80] or "doc"
+
+
+def _web_rank(query: str, results: list[dict]) -> list[dict]:
+    """Re-rank ringan: dahulukan yang judul/snippet-nya memuat kata query."""
+    toks = [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
+
+    def score(r: dict) -> int:
+        text = (r.get("title", "") + " " + r.get("snippet", "")).lower()
+        return sum(1 for t in toks if t in text)
+
+    return sorted(results, key=score, reverse=True)
 
 
 def web_search(query: str, limit: int = 10) -> dict:
@@ -915,16 +960,16 @@ def web_search(query: str, limit: int = 10) -> dict:
     now = time.time()
     if row and now - row[1] < WEB_CACHE_TTL:
         con.close()
-        results = json.loads(row[0])
+        results = _web_rank(q, json.loads(row[0]))
         _log_event("search", query=q)
         return {"query": q, "results": results[:limit],
                 "sources": sorted({r["source"] for r in results}),
                 "cached": True, "brave": brave_on, "learned": 0}
     results: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         futs = [ex.submit(_web_wikipedia, q), ex.submit(_web_duckduckgo, q),
                 ex.submit(_web_hackernews, q), ex.submit(_web_stackexchange, q),
-                ex.submit(_web_brave, q)]
+                ex.submit(_web_github, q), ex.submit(_web_brave, q)]
         for f in concurrent.futures.as_completed(futs):
             try:
                 results.extend(f.result() or [])
@@ -958,6 +1003,7 @@ def web_search(query: str, limit: int = 10) -> dict:
             pass
     _log_event("search", query=q)
     con.close()
+    uniq = _web_rank(q, uniq)
     return {"query": q, "results": uniq[:limit],
             "sources": sorted({r["source"] for r in uniq}),
             "cached": False, "brave": brave_on, "learned": learned}
