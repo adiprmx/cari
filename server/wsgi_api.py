@@ -36,6 +36,9 @@ Mesin pencari yang belajar sendiri:
       60 req/jam — jauh lebih longgar dari Search API 10 req/mnt di IP
       bersama) agar query username 1 kata tetap ketemu saat Search
       API ke-rate-limit.
+      v0.9.2: hasil web membawa "image" (thumbnail Wikipedia via
+      pageimages, avatar GitHub, cover buku Open Library); frontend
+      menampilkan thumbnail, fallback ke favicon domain.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -70,7 +73,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -809,21 +812,27 @@ def _http_get_json(url: str, headers: dict | None = None,
 
 
 def _web_wikipedia(query: str) -> list[dict]:
-    """Wikipedia API (id -> fallback en). Resmi, tanpa key."""
+    """Wikipedia API (id -> fallback en) + thumbnail. Resmi, tanpa key."""
     out: list[dict] = []
     for lang in ("id", "en"):
         try:
             u = f"https://{lang}.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
-                "action": "query", "list": "search", "srsearch": query,
-                "srlimit": 8, "format": "json", "formatversion": "2"})
+                "action": "query", "generator": "search", "gsrsearch": query,
+                "gsrlimit": 8, "prop": "pageimages|extracts",
+                "pithumbsize": 200, "exintro": 1, "explaintext": 1, "exsentences": 2,
+                "format": "json", "formatversion": "2"})
             d = _http_get_json(u)
-            for it in d.get("query", {}).get("search", []):
+            pages = d.get("query", {}).get("pages", [])
+            pages = sorted(pages, key=lambda p: p.get("index", 0))
+            for it in pages:
                 title = it.get("title", "")
                 url = (f"https://{lang}.wikipedia.org/wiki/"
                        + urllib.parse.quote(title.replace(" ", "_")))
-                snip = htmlmod.unescape(re.sub(r"<[^>]+>", "", it.get("snippet", "")))
-                out.append({"title": title, "url": url, "snippet": snip.strip(),
-                            "source": "wikipedia"})
+                thumb = (it.get("thumbnail") or {}).get("source") or ""
+                out.append({"title": title, "url": url,
+                            "snippet": (it.get("extract") or "").strip()[:300],
+                            "source": "wikipedia",
+                            **({"image": thumb} if thumb else {})})
             if out:
                 break
         except Exception:
@@ -957,7 +966,8 @@ def _web_github_user(query: str) -> list[dict]:
         return [{"title": f"{d.get('login')} (GitHub)",
                  "url": d["html_url"],
                  "snippet": meta or "Profil GitHub",
-                 "source": "github"}]
+                 "source": "github",
+                 **({"image": d["avatar_url"]} if d.get("avatar_url") else {})}]
     except Exception:
         return []
 
@@ -983,7 +993,8 @@ def _web_github(query: str) -> list[dict]:
                 "url": it["html_url"],
                 "snippet": (it.get("bio") or "Profil GitHub") +
                            f" · {it.get('public_repos', 0)} repo publik",
-                "source": "github"})
+                "source": "github",
+                **({"image": it["avatar_url"]} if it.get("avatar_url") else {})})
         u = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
             {"q": query, "per_page": 6, "sort": "stars", "order": "desc"})
         d = _http_get_json(u)
@@ -995,7 +1006,9 @@ def _web_github(query: str) -> list[dict]:
                 "url": it["html_url"],
                 "snippet": (it.get("description") or "Repositori GitHub") +
                             f" · ★ {it.get('stargazers_count', 0)}",
-                "source": "github"})
+                "source": "github",
+                **({"image": (it.get("owner") or {}).get("avatar_url")}
+                   if (it.get("owner") or {}).get("avatar_url") else {})})
     except urllib.error.HTTPError as e:
         if e.code in (403, 429):
             _GITHUB_BACKOFF_UNTIL = time.time() + 600
@@ -1140,7 +1153,7 @@ def _web_openlibrary(query: str) -> list[dict]:
     try:
         u = "https://openlibrary.org/search.json?" + urllib.parse.urlencode(
             {"q": query, "limit": 5,
-             "fields": "key,title,author_name,first_publish_year"})
+             "fields": "key,title,author_name,first_publish_year,cover_i"})
         for b in _http_get_json(u, timeout=10).get("docs", []):
             key, title = b.get("key") or "", b.get("title") or ""
             if not (key and title):
@@ -1148,9 +1161,12 @@ def _web_openlibrary(query: str) -> list[dict]:
             auth = ", ".join(b.get("author_name") or [])
             meta = " · ".join(x for x in
                               [auth, str(b.get("first_publish_year") or "")] if x)
+            cover = b.get("cover_i")
             out.append({"title": title,
                         "url": "https://openlibrary.org" + key,
-                        "snippet": meta or "Buku", "source": "openlibrary"})
+                        "snippet": meta or "Buku", "source": "openlibrary",
+                        **({"image": f"https://covers.openlibrary.org/b/id/{cover}-S.jpg"}
+                           if cover else {})})
     except Exception:
         pass
     return out
@@ -1228,12 +1244,20 @@ def _web_slug(url: str) -> str:
 
 
 def _web_rank(query: str, results: list[dict]) -> list[dict]:
-    """Re-rank ringan: dahulukan yang judul/snippet-nya memuat kata query."""
+    """Re-rank: hitung kemunculan kata (judul 3x bobot snippet) + bonus
+    frasa utuh di judul. Menghindari seri massal di query 1 kata."""
     toks = [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
+    phrase = " ".join(toks)
 
     def score(r: dict) -> int:
-        text = (r.get("title", "") + " " + r.get("snippet", "")).lower()
-        return sum(1 for t in toks if t in text)
+        title = (r.get("title") or "").lower()
+        snip = (r.get("snippet") or "").lower()
+        s = 0
+        for t in toks:
+            s += 3 * title.count(t) + snip.count(t)
+        if phrase and phrase in title:
+            s += 5
+        return s
 
     return sorted(results, key=score, reverse=True)
 
@@ -1274,6 +1298,9 @@ def web_search(query: str, limit: int = 10) -> dict:
         if u and u not in seen:
             seen.add(u)
             uniq.append(r)
+    # Rank DULU baru potong: jangan sampai backend lambat tapi relevan
+    # (mis. Wikipedia) kepotong backend cepat sebelum sempat di-rank.
+    uniq = _web_rank(q, uniq)
     uniq = uniq[:max(limit * 2, 20)]
     # jangan cache hasil kosong: backend bisa pulih (mis. rate-limit reda),
     # dan hasil kosong yang di-cache menutupi hasil baru selama 24 jam.
@@ -1299,7 +1326,6 @@ def web_search(query: str, limit: int = 10) -> dict:
             pass
     _log_event("search", query=q)
     con.close()
-    uniq = _web_rank(q, uniq)
     return {"query": q, "results": uniq[:limit],
             "sources": sorted({r["source"] for r in uniq}),
             "cached": False, "brave": brave_on, "learned": learned}
