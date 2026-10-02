@@ -1,4 +1,4 @@
-"""CARI Server v0.8 "Web Mode" — 100% stdlib, tanpa pip install.
+"""CARI Server v0.9 "Web Mode Max" — 100% stdlib, tanpa pip install.
 
 Mesin pencari yang belajar sendiri:
   Pilar 1 — Belajar dari pengguna (learning to rank, 100% lokal):
