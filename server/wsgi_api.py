@@ -10,7 +10,8 @@ Mesin pencari yang belajar sendiri:
     * Saran query + toleransi typo dari riwayat pencarian (GET /suggest).
     * Tren pencarian 7 hari terakhir (GET /trends).
   Pilar 2 — Cari tahu sendiri (auto-ingest & enrichment):
-    * POST /ingest {url}: fetch halaman web -> ekstrak teks -> index otomatis.
+    * POST /ingest {url}: fetch halaman -> ekstrak teks -> index otomatis.
+      Jika situs di luar whitelist, otomatis dicoba via Jina Reader proxy.
       (Catatan: di PythonAnywhere gratis, outbound hanya ke situs whitelist —
       error fetch dijelaskan dengan jujur di respons.)
     * Setiap dokumen otomatis: deteksi bahasa (id/en), ekstraksi keyword,
@@ -24,10 +25,13 @@ Mesin pencari yang belajar sendiri:
     "belajar ulang" dari seluruh event klik (dipanggil via scheduled task
     harian: curl -X POST -H "X-API-Key: ..." https://.../learn).
   Pilar 4 — Web Mode / metasearch (v0.8+):
-    * GET /web/search?q=... : cari di web lewat backend resmi tanpa API key:
-      Wikipedia, DuckDuckGo Instant Answer, Hacker News (Algolia),
-      Stack Exchange, GitHub (user + repo) — semuanya lolos whitelist
-      outbound PythonAnywhere.
+    * GET /web/search?q=... : cari di web lewat 14 backend resmi tanpa API key
+      (v0.9): Wikipedia, DuckDuckGo Instant Answer, DuckDuckGo Lite (hasil
+      web umum), Qwant (hasil web umum), Hacker News (Algolia),
+      Stack Exchange, GitHub (user + repo), OpenAlex (paper), arXiv (paper),
+      PubMed (medis), Open Library (buku), Internet Archive (arsip),
+      npm (paket JS), Wikidata (entitas). Semua berjalan paralel;
+      yang ke-block whitelist diam-diam dilewati (try/except per backend).
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -60,8 +64,9 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
-VERSION = "0.8.3"
+VERSION = "0.9.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -729,16 +734,30 @@ def ingest_url(url: str) -> dict:
             raw = r.read(INGEST_MAX_BYTES + 1)
     except ValueError:
         raise
-    except Exception as e:
-        raise ValueError(
-            "gagal fetch URL "
-            f"({type(e).__name__}: {e}). Di PythonAnywhere gratis, situs harus "
-            "masuk whitelist outbound — coba URL dari situs umum populer.") from e
+    except Exception:
+        # Fallback: Jina Reader — proxy yang bisa menjangkau situs di luar
+        # whitelist outbound PythonAnywhere.
+        try:
+            rj = urllib.request.Request("https://r.jina.ai/" + url,
+                                        headers={"User-Agent": "CARI/0.9"})
+            with urllib.request.urlopen(rj, timeout=25) as r:
+                raw = r.read(INGEST_MAX_BYTES + 1)
+            ctype = "text/markdown"
+        except Exception as e2:
+            raise ValueError(
+                "gagal fetch URL "
+                f"({type(e2).__name__}). Di PythonAnywhere gratis, situs harus "
+                "masuk whitelist outbound — coba URL dari situs umum populer.") from e2
     if len(raw) > INGEST_MAX_BYTES:
         raise ValueError("halaman terlalu besar (>700KB)")
     m = re.search(r"charset=([\w-]+)", ctype or "")
     html = raw.decode(m.group(1) if m else "utf-8", errors="replace")
     title, text = _html_to_text(html)
+    if not title and ctype == "text/markdown":
+        # format Jina Reader diawali "Title: ...\nURL Source: ..."
+        mt = re.search(r"^Title:\s*(.+)$", html, re.M)
+        if mt:
+            title = mt.group(1).strip()[:200]
     if len(text) < 50:
         raise ValueError("tidak cukup teks yang bisa diekstrak dari halaman ini")
     slug = re.sub(r"[^a-z0-9]+", "-", (parts.netloc + parts.path).lower()).strip("-")[:60]
@@ -762,7 +781,7 @@ def reindex_full() -> dict:
 # Siap Brave Search API: set env BRAVE_API_KEY -> backend brave ikut dipakai
 # (perlu api.search.brave.com lolos whitelist outbound).
 
-WEB_UA = {"User-Agent": "CARI/0.8 (personal search engine; +https://adiprmx.github.io/cari/)"}
+WEB_UA = {"User-Agent": "CARI/0.9 (personal search engine; +https://adiprmx.github.io/cari/)"}
 WEB_TIMEOUT = 10
 WEB_CACHE_TTL = 24 * 3600  # detik — hasil web mentah di-cache 1 hari
 
@@ -900,7 +919,9 @@ def _web_stackexchange(query: str) -> list[dict]:
     return out
 
 
-WEB_SOURCES = ["wikipedia", "duckduckgo", "hackernews", "stackexchange", "github"]
+WEB_SOURCES = ["wikipedia", "duckduckgo", "ddg_lite", "qwant", "hackernews",
+               "stackexchange", "github", "openalex", "arxiv", "pubmed",
+               "openlibrary", "archive", "npm", "wikidata"]
 
 
 # Backoff GitHub saat kena rate-limit (403/429) di IP bersama.
@@ -950,6 +971,222 @@ def _web_github(query: str) -> list[dict]:
     return out[:10]
 
 
+def _web_ddg_lite(query: str) -> list[dict]:
+    """DuckDuckGo Lite (HTML) — hasil web umum. Scraping ringan."""
+    out: list[dict] = []
+    try:
+        u = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode({"q": query})
+        req = urllib.request.Request(u, headers={**WEB_UA, "Accept": "text/html"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read(300_000).decode("utf-8", "replace")
+        for m in re.finditer(
+                r'<a[^>]*rel="nofollow"[^>]*href="//duckduckgo\.com/l/\?uddg=([^"&]+)[^"]*"[^>]*>(.*?)</a>',
+                raw, re.S):
+            url = urllib.parse.unquote(m.group(1))
+            title = re.sub(r"<[^>]+>", "", htmlmod.unescape(m.group(2))).strip()
+            if url.startswith("http") and title and "duckduckgo.com" not in url:
+                out.append({"title": title, "url": url,
+                            "snippet": "Hasil web via DuckDuckGo",
+                            "source": "ddg_lite"})
+            if len(out) >= 6:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _web_qwant(query: str) -> list[dict]:
+    """Qwant API v3 — hasil web umum (Eropa). Tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://api.qwant.com/v3/search/web?" + urllib.parse.urlencode(
+            {"t": "web", "q": query, "locale": "id_ID", "count": 8, "safesearch": 1})
+        d = _http_get_json(u, timeout=10)
+        items = d.get("data", {}).get("result", {}).get("items", []) or []
+        for it in items:
+            url = it.get("url") or ""
+            title = htmlmod.unescape((it.get("title") or "").strip())
+            if not (url.startswith("http") and title):
+                continue
+            desc = htmlmod.unescape(re.sub(r"<[^>]+>", "", it.get("desc") or ""))
+            out.append({"title": title, "url": url,
+                        "snippet": desc[:300] or "Hasil web via Qwant",
+                        "source": "qwant"})
+            if len(out) >= 6:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _web_openalex(query: str) -> list[dict]:
+    """OpenAlex — paper & jurnal akademik. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://api.openalex.org/works?" + urllib.parse.urlencode(
+            {"search": query, "per-page": 5,
+             "select": "id,doi,title,publication_year,cited_by_count,primary_location"})
+        for w in _http_get_json(u, timeout=10).get("results", []):
+            title = w.get("title") or ""
+            if not title:
+                continue
+            url = ("https://doi.org/" + w["doi"]) if w.get("doi") else (w.get("id") or "")
+            src = ((w.get("primary_location") or {}).get("source") or {})
+            meta = " · ".join(x for x in
+                              [src.get("display_name") or "",
+                               str(w.get("publication_year") or ""),
+                               f"disitasi {w.get('cited_by_count', 0)}"] if x)
+            out.append({"title": htmlmod.unescape(title), "url": url,
+                        "snippet": meta or "Paper akademik", "source": "openalex"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_arxiv(query: str) -> list[dict]:
+    """arXiv — paper ilmiah. Resmi, tanpa key (ATOM XML)."""
+    out: list[dict] = []
+    try:
+        u = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(
+            {"search_query": f'all:"{query}"', "start": 0, "max_results": 5,
+             "sortBy": "relevance", "sortOrder": "descending"})
+        req = urllib.request.Request(u, headers=dict(WEB_UA))
+        with urllib.request.urlopen(req, timeout=12) as r:
+            raw = r.read(300_000)
+        root = ET.fromstring(raw)
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        for e in root.findall("a:entry", ns)[:5]:
+            title = re.sub(r"\s+", " ", (e.findtext("a:title", default="",
+                                                   namespaces=ns) or "")).strip()
+            link = (e.findtext("a:id", default="", namespaces=ns) or "").strip()
+            summary = re.sub(r"\s+", " ", (e.findtext("a:summary", default="",
+                                                     namespaces=ns) or "")).strip()
+            if title and link.startswith("http"):
+                out.append({"title": title, "url": link,
+                            "snippet": summary[:300] or "Paper arXiv",
+                            "source": "arxiv"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_pubmed(query: str) -> list[dict]:
+    """PubMed/NCBI — literatur medis. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+        s = _http_get_json(base + "esearch.fcgi?" + urllib.parse.urlencode(
+            {"db": "pubmed", "term": query, "retmax": 5, "retmode": "json",
+             "sort": "relevance", "tool": "cari"}), timeout=10)
+        ids = (s.get("esearchresult") or {}).get("idlist", [])
+        if not ids:
+            return []
+        d = _http_get_json(base + "esummary.fcgi?" + urllib.parse.urlencode(
+            {"db": "pubmed", "id": ",".join(ids), "retmode": "json",
+             "tool": "cari"}), timeout=10)
+        res = d.get("result", {})
+        for i in res.get("uids", []):
+            it = res.get(i) or {}
+            title = it.get("title") or ""
+            if not title:
+                continue
+            meta = " · ".join(x for x in
+                              [it.get("source") or "", it.get("pubdate") or ""] if x)
+            out.append({"title": htmlmod.unescape(title),
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{i}/",
+                        "snippet": meta or "PubMed", "source": "pubmed"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_openlibrary(query: str) -> list[dict]:
+    """Open Library — buku. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://openlibrary.org/search.json?" + urllib.parse.urlencode(
+            {"q": query, "limit": 5,
+             "fields": "key,title,author_name,first_publish_year"})
+        for b in _http_get_json(u, timeout=10).get("docs", []):
+            key, title = b.get("key") or "", b.get("title") or ""
+            if not (key and title):
+                continue
+            auth = ", ".join(b.get("author_name") or [])
+            meta = " · ".join(x for x in
+                              [auth, str(b.get("first_publish_year") or "")] if x)
+            out.append({"title": title,
+                        "url": "https://openlibrary.org" + key,
+                        "snippet": meta or "Buku", "source": "openlibrary"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_archive(query: str) -> list[dict]:
+    """Internet Archive — buku/teks/media arsip. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        params = [("q", query), ("fl[]", "identifier"), ("fl[]", "title"),
+                  ("fl[]", "description"), ("rows", 5), ("output", "json")]
+        u = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
+        docs = _http_get_json(u, timeout=12).get("response", {}).get("docs", [])
+        for it in docs:
+            ident = it.get("identifier") or ""
+            if not ident:
+                continue
+            desc = it.get("description") or ""
+            if isinstance(desc, list):
+                desc = desc[0] if desc else ""
+            out.append({"title": it.get("title") or ident,
+                        "url": f"https://archive.org/details/{ident}",
+                        "snippet": str(desc)[:300] or "Arsip Internet Archive",
+                        "source": "archive"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_npm(query: str) -> list[dict]:
+    """npm registry — paket JavaScript. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://registry.npmjs.org/-/v1/search?" + urllib.parse.urlencode(
+            {"text": query, "size": 5})
+        for o in _http_get_json(u, timeout=10).get("objects", []):
+            p = o.get("package") or {}
+            name = p.get("name") or ""
+            if not name:
+                continue
+            ver = p.get("version") or ""
+            out.append({"title": f"{name} {ver}".strip(),
+                        "url": f"https://www.npmjs.com/package/{name}",
+                        "snippet": (p.get("description") or "Paket npm")[:300],
+                        "source": "npm"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_wikidata(query: str) -> list[dict]:
+    """Wikidata — entitas pengetahuan terstruktur. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://www.wikidata.org/w/api.php?" + urllib.parse.urlencode(
+            {"action": "wbsearchentities", "search": query, "language": "id",
+             "uselang": "id", "format": "json", "limit": 5, "formatversion": "2"})
+        for it in _http_get_json(u, timeout=10).get("search", []):
+            qid = it.get("id") or ""
+            if not qid:
+                continue
+            out.append({"title": it.get("label") or qid,
+                        "url": f"https://www.wikidata.org/wiki/{qid}",
+                        "snippet": (it.get("description") or "Entitas Wikidata")[:300],
+                        "source": "wikidata"})
+    except Exception:
+        pass
+    return out
+
+
 def _web_slug(url: str) -> str:
     s = re.sub(r"^https?://(www\.)?", "", url.strip().lower())
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
@@ -985,10 +1222,12 @@ def web_search(query: str, limit: int = 10) -> dict:
                 "sources": sorted({r["source"] for r in results}),
                 "cached": True, "brave": brave_on, "learned": 0}
     results: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        futs = [ex.submit(_web_wikipedia, q), ex.submit(_web_duckduckgo, q),
-                ex.submit(_web_hackernews, q), ex.submit(_web_stackexchange, q),
-                ex.submit(_web_github, q), ex.submit(_web_brave, q)]
+    backends = [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
+                _web_hackernews, _web_stackexchange, _web_github,
+                _web_openalex, _web_arxiv, _web_pubmed, _web_openlibrary,
+                _web_archive, _web_npm, _web_wikidata, _web_brave]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(backends)) as ex:
+        futs = [ex.submit(fn, q) for fn in backends]
         for f in concurrent.futures.as_completed(futs):
             try:
                 results.extend(f.result() or [])
