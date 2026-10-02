@@ -44,6 +44,16 @@ Mesin pencari yang belajar sendiri:
       limit per backend naik (7-8); respons sertakan backends_queried.
       v0.11: GET /search/all — cari lokal + web SEKALIGUS (paralel),
       satu respons {web, local}; tab Lokal/Web dihapus dari UI.
+      v0.12: rank presisi (whole-word di judul, exact phrase, coverage,
+      buang 0-match multi-kata); kumpul paralel max 2.5 dtk; bobot
+      kepercayaan sumber (_SOURCE_TRUST).
+      v0.13 "Backend Expansion": 10 backend baru tanpa key (Semantic
+      Scholar, Crossref, crates.io, Packagist, Docker Hub, Nominatim,
+      MusicBrainz, Open-Meteo, Lobsters, DBpedia) + 2 key-opsional
+      (TMDB, Tavily); router kategori baru (cuaca/tempat/film/musik/
+      paper/paket/tech/knowledge) 7-10 backend/query; chain fallback
+      primer->cadangan per kategori; Brave DIHAPUS TOTAL & BLACKLIST
+      permanen (paid/wajib kartu kredit) -> digantikan Tavily.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -51,8 +61,12 @@ Mesin pencari yang belajar sendiri:
       berversi -> otomatis invalid tiap upgrade; hasil kosong tidak di-cache).
     * GitHub backend punya backoff 10 menit saat kena 403/429 (IP gratisan
       dipakai bersama, rawan rate-limit).
-    * Siap Brave Search API: cukup set env BRAVE_API_KEY di WSGI config,
-      backend brave ikut dipakai (perlu api.search.brave.com di-whitelist).
+    * Brave Search API DIHAPUS TOTAL & BLACKLIST permanen (v0.13): ternyata
+      paid / wajib kartu kredit -> melanggar aturan keras zero-budget proyek.
+      Jangan pernah dijadikan kandidat lagi.
+    * Siap Tavily API: cukup set env TAVILY_API_KEY di WSGI config,
+      backend tavily ikut dipakai (paket gratis, tanpa kartu kredit;
+      perlu api.tavily.com di-whitelist).
 
 Deploy sama seperti v0.6: upload file ini ke ~/cari-server, WSGI config:
     import os, sys
@@ -78,7 +92,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -703,6 +717,76 @@ def _looks_internal_title(title: str) -> bool:
     return t.startswith("web-") or t.endswith((".md", ".markdown", ".txt"))
 
 
+_TITLES_HEALED = False  # v0.13: migrasi judul internal, sekali per proses worker
+
+
+def _self_heal_titles(limit: int = 2000) -> dict:
+    """v0.13 SELF-HEALING: perbaiki judul dokumen lama yang masih berupa
+    basename internal (mis. "web-ddg_lite-....md").
+
+    Latar: _index_file skip file yang mtime-nya tak berubah, sehingga judul
+    internal era pra-v0.12 tak pernah terkoreksi otomatis (reindex manual
+    via browser gagal). Migrasi ini:
+    - idempotent: hanya menyentuh baris yang lolos _looks_internal_title;
+    - cepat: maks `limit` baris per proses, baca maks 20KB per file;
+    - aman: tidak menghapus data apa pun, hanya UPDATE title (FTS tak perlu
+      disentuh karena judul dibaca dari tabel docs saat search).
+    Dipanggil sekali per proses worker pada request pertama application()."""
+    global _TITLES_HEALED
+    if _TITLES_HEALED:
+        return {"healed": 0, "already": True}
+    healed = 0
+    try:
+        con = _connect()
+        rows = con.execute(
+            """SELECT id, path, title FROM docs
+               WHERE LOWER(title) LIKE 'web-%' OR LOWER(title) LIKE '%.md'
+                  OR LOWER(title) LIKE '%.markdown' OR LOWER(title) LIKE '%.txt'
+               LIMIT ?""",
+            (limit,)).fetchall()
+        for doc_id, path, title in rows:
+            if not _looks_internal_title(title):
+                continue
+            new_title = None
+            try:
+                with open(path, encoding="utf-8") as f:
+                    head = f.read(20000)
+                # pola yang sama dengan _index_file v0.12
+                m = re.search(r"^\s*#{1,6}\s+(.+?)\s*$", head, re.M)
+                if m:
+                    new_title = m.group(1).strip()[:200]
+            except Exception:
+                new_title = None
+            if (new_title and new_title != title
+                    and not _looks_internal_title(new_title)):
+                con.execute("UPDATE docs SET title = ? WHERE id = ?",
+                            (new_title, doc_id))
+                healed += 1
+        con.commit()
+        con.close()
+    except Exception:
+        # DB/tabel belum siap -> jangan tandai selesai, coba lagi request berikut
+        return {"healed": healed, "error": True}
+    _TITLES_HEALED = True
+    return {"healed": healed}
+
+
+def _looks_like_url_answer(s: str) -> bool:
+    """v0.13: kalimat kandidat jawaban tidak boleh berupa URL mentah atau
+    baris atribusi "Sumber: ..." — jawaban harus kalimat alami."""
+    t = (s or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    if re.match(r"^(sumber|source)\s*:", low):
+        return True  # atribusi mentah, bukan kalimat informasi
+    if low.startswith(("http://", "https://", "www.")):
+        return True
+    if " " not in t and "." in t and re.match(r"^[\w\-./:?=&%#@+]+$", t):
+        return True  # satu token mirip URL tanpa spasi
+    return False
+
+
 def answer(query: str) -> dict:
     hits = search(query, limit=5, log=False)
     # v0.12 pertahanan lapis kedua: buang hits berjudul internal dari
@@ -729,6 +813,8 @@ def answer(query: str) -> dict:
         if not row:
             continue
         for s in _sentences(row[0]):
+            if _looks_like_url_answer(s):
+                continue  # v0.13: jawaban tak boleh URL mentah / "Sumber: ..."
             toks = set(_tokens(s))
             if multi:
                 s_low = s.lower()
@@ -826,10 +912,11 @@ def reindex_full() -> dict:
 # CARI jadi metasearch: narik hasil dari backend web resmi (tanpa API key),
 # lalu setiap hasil OTOMATIS di-index permanen ke database lokal -> index
 # tumbuh dari pencarianmu (mesin yang benar-benar belajar sendiri).
-# Siap Brave Search API: set env BRAVE_API_KEY -> backend brave ikut dipakai
-# (perlu api.search.brave.com lolos whitelist outbound).
+# Siap Tavily API: set env TAVILY_API_KEY -> backend tavily ikut dipakai
+# (paket gratis 'Researcher', tanpa kartu kredit; perlu api.tavily.com lolos
+# whitelist outbound). Brave di-blacklist permanen (butuh CC) — dihapus total.
 
-WEB_UA = {"User-Agent": "CARI/0.9 (personal search engine; +https://adiprmx.github.io/cari/)"}
+WEB_UA = {"User-Agent": "CARI/0.13 (personal search engine; +https://adiprmx.github.io/cari/)"}
 WEB_TIMEOUT = 5
 # v0.12: batas kumpul hasil backend per query — jangan tunggu backend yang
 # lambat; ambil yang sudah selesai, sisanya dibatalkan. Target total <3 dtk.
@@ -853,6 +940,34 @@ def _http_get_json(url: str, headers: dict | None = None,
     req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _http_post_json(url: str, payload: dict, headers: dict | None = None,
+                    timeout: int = WEB_TIMEOUT) -> dict:
+    """v0.13: POST JSON (untuk Tavily)."""
+    h = dict(WEB_UA)
+    h["Content-Type"] = "application/json"
+    if headers:
+        h.update(headers)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+# v0.13: throttle lokal per-backend. Beberapa API (Nominatim, MusicBrainz,
+# crates.io) mewajibkan max 1 req/detik per IP. Setiap backend berjalan di
+# thread pool sendiri, jadi sleep di sini tidak menahan backend lain dalam
+# window kumpul 2.5 dtk.
+_LAST_CALL: dict[str, float] = {}
+
+
+def _throttle(name: str, min_interval: float) -> None:
+    last = _LAST_CALL.get(name, 0.0)
+    wait = min_interval - (time.time() - last)
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_CALL[name] = time.time()
 
 
 def _web_wikipedia(query: str) -> list[dict]:
@@ -915,23 +1030,6 @@ def _web_duckduckgo(query: str) -> list[dict]:
     return out[:12]
 
 
-def _web_brave(query: str) -> list[dict]:
-    """Brave Search API — aktif kalau env BRAVE_API_KEY di-set."""
-    key = os.environ.get("BRAVE_API_KEY", "").strip()
-    if not key:
-        return []
-    try:
-        u = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(
-            {"q": query, "count": 10, "search_lang": "id", "safesearch": "moderate"})
-        d = _http_get_json(u, headers={"X-Subscription-Token": key,
-                                       "Accept": "application/json"})
-        return [{"title": r.get("title", ""), "url": r.get("url", ""),
-                 "snippet": r.get("description", ""), "source": "brave"}
-                for r in d.get("web", {}).get("results", []) if r.get("url")]
-    except Exception:
-        return []
-
-
 def _web_hackernews(query: str) -> list[dict]:
     """Hacker News via Algolia API. Resmi, tanpa key."""
     out: list[dict] = []
@@ -976,9 +1074,15 @@ def _web_stackexchange(query: str) -> list[dict]:
     return out
 
 
+# v0.13: brave DIHAPUS TOTAL & BLACKLIST permanen (paid/wajib kartu kredit ->
+# melanggar zero-budget). tavily & tmdb key-opsional: tidak di list statis,
+# hanya ditambahkan ke /health bila env key-nya di-set.
 WEB_SOURCES = ["wikipedia", "duckduckgo", "ddg_lite", "qwant", "hackernews",
                "stackexchange", "github", "openalex", "arxiv", "pubmed",
-               "openlibrary", "archive", "npm", "wikidata"]
+               "openlibrary", "archive", "npm", "wikidata",
+               "semanticscholar", "crossref", "crates", "packagist",
+               "dockerhub", "nominatim", "musicbrainz", "openmeteo",
+               "lobsters", "dbpedia"]
 
 
 # Backoff GitHub saat kena rate-limit (403/429) di IP bersama.
@@ -1281,6 +1385,445 @@ def _web_wikidata(query: str) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------------- v0.13 Backend Expansion
+# WAJIB (tanpa key): semanticscholar, crossref, crates, packagist, dockerhub,
+# nominatim, musicbrainz, openmeteo, lobsters, dbpedia.
+# KEY-OPSIONAL (dormant tanpa env): tmdb (TMDB_API_KEY), tavily (TAVILY_API_KEY).
+
+# Backoff Semantic Scholar saat kena rate-limit (403/429) di pool keyless
+# bersama — pola sama seperti GitHub.
+_SS_BACKOFF_UNTIL = 0.0
+
+
+def _web_semanticscholar(query: str) -> list[dict]:
+    """Semantic Scholar — paper akademik. Resmi, tanpa key.
+
+    Pool keyless dipakai seluruh internet -> sering 429. Wajib backoff
+    10 menit bila kena 403/429, jangan jadikan backend kritis."""
+    global _SS_BACKOFF_UNTIL
+    if time.time() < _SS_BACKOFF_UNTIL:
+        return []
+    out: list[dict] = []
+    try:
+        u = ("https://api.semanticscholar.org/graph/v1/paper/search?"
+             + urllib.parse.urlencode(
+                 {"query": query, "limit": 7,
+                  "fields": "title,abstract,year,venue,authors,"
+                            "citationCount,url,openAccessPdf"}))
+        for p in _http_get_json(u, timeout=5).get("data", []):
+            title = p.get("title") or ""
+            if not title:
+                continue
+            url = ((p.get("openAccessPdf") or {}).get("url")
+                   or p.get("url") or "")
+            if not url.startswith("http"):
+                url = ("https://www.semanticscholar.org/paper/"
+                       + (p.get("paperId") or ""))
+            authors = ", ".join(a.get("name", "")
+                                for a in (p.get("authors") or [])[:3])
+            meta = " · ".join(x for x in
+                              [authors, str(p.get("year") or ""),
+                               p.get("venue") or "",
+                               f"disitasi {p.get('citationCount', 0)}"] if x)
+            abstract = (p.get("abstract") or "").strip()[:280]
+            snippet = (f"{abstract} — {meta}" if abstract
+                       else (meta or "Paper akademik"))
+            out.append({"title": title, "url": url,
+                        "snippet": snippet[:400],
+                        "source": "semanticscholar"})
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            _SS_BACKOFF_UNTIL = time.time() + 600
+        return []
+    except Exception:
+        return []
+    return out[:7]
+
+
+def _web_crossref(query: str) -> list[dict]:
+    """Crossref — publikasi & DOI. Resmi, tanpa key (UA deskriptif -> polite pool)."""
+    out: list[dict] = []
+    try:
+        u = "https://api.crossref.org/works?" + urllib.parse.urlencode(
+            {"query": query, "rows": 7,
+             "select": "title,author,published,DOI,URL,abstract"})
+        d = _http_get_json(u, timeout=5)
+        for it in (d.get("message") or {}).get("items", []):
+            titles = it.get("title") or []
+            title = titles[0] if titles else ""
+            if not title:
+                continue
+            doi = it.get("DOI") or ""
+            url = it.get("URL") or (f"https://doi.org/{doi}" if doi else "")
+            if not url.startswith("http"):
+                continue
+            authors = ", ".join(
+                " ".join(x for x in (a.get("given"), a.get("family")) if x)
+                for a in (it.get("author") or [])[:3])
+            pub = (it.get("published") or {}).get("date-parts") or [[]]
+            year = str(pub[0][0]) if pub and pub[0] else ""
+            meta = " · ".join(x for x in [authors, year] if x)
+            abstract = re.sub(r"<[^>]+>", "", it.get("abstract") or "")
+            snippet = (f"{abstract[:260]} — {meta}" if abstract
+                       else (meta or "Publikasi Crossref"))
+            out.append({"title": htmlmod.unescape(title), "url": url,
+                        "snippet": snippet[:400], "source": "crossref"})
+    except Exception:
+        pass
+    return out[:7]
+
+
+def _web_crates(query: str) -> list[dict]:
+    """crates.io — paket Rust. Resmi, tanpa key (UA deskriptif WAJIB, 403 tanpa UA)."""
+    out: list[dict] = []
+    try:
+        _throttle("crates", 1.0)
+        u = "https://crates.io/api/v1/crates?" + urllib.parse.urlencode(
+            {"q": query, "per_page": 7, "sort": "relevance"})
+        for c in _http_get_json(u, timeout=5).get("crates", []):
+            name = c.get("name") or ""
+            if not name:
+                continue
+            desc = (c.get("description") or "Crate Rust")[:280]
+            meta = " · ".join(x for x in
+                              [f"v{c.get('max_version')}" if c.get("max_version") else "",
+                               f"{c.get('downloads', 0)} unduhan"] if x)
+            out.append({"title": name,
+                        "url": f"https://crates.io/crates/{name}",
+                        "snippet": f"{desc} · {meta}" if meta else desc,
+                        "source": "crates"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_packagist(query: str) -> list[dict]:
+    """Packagist — paket PHP/Composer. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://packagist.org/search.json?" + urllib.parse.urlencode(
+            {"q": query, "per_page": 7})
+        for r in _http_get_json(u, timeout=5).get("results", []):
+            name = r.get("name") or ""
+            url = r.get("url") or ""
+            if not (name and url.startswith("http")):
+                continue
+            desc = (r.get("description") or "Paket PHP")[:280]
+            meta = " · ".join(x for x in
+                              [f"{r.get('downloads', 0)} unduhan",
+                               f"{r.get('favers', 0)} bintang"] if x)
+            out.append({"title": name, "url": url,
+                        "snippet": f"{desc} · {meta}" if meta else desc,
+                        "source": "packagist"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_dockerhub(query: str) -> list[dict]:
+    """Docker Hub — image container. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = ("https://hub.docker.com/v2/search/repositories/?"
+             + urllib.parse.urlencode({"query": query, "page_size": 7}))
+        for r in _http_get_json(u, timeout=5).get("results", []):
+            repo = r.get("repo_name") or ""
+            if not repo:
+                continue
+            desc = (r.get("description") or "Docker image")[:280]
+            meta = " · ".join(x for x in
+                              [f"★ {r.get('star_count', 0)}",
+                               f"{r.get('pull_count', 0)} pulls"] if x)
+            out.append({"title": repo,
+                        "url": f"https://hub.docker.com/r/{repo}",
+                        "snippet": f"{desc} · {meta}" if meta else desc,
+                        "source": "dockerhub"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_nominatim(query: str) -> list[dict]:
+    """Nominatim OSM — geocoding tempat. Resmi, tanpa key.
+
+    Kebijakan: max 1 req/detik + UA deskriptif. HANYA dipanggil router untuk
+    query yang terdeteksi 'tempat' (lihat _route_backends)."""
+    out: list[dict] = []
+    try:
+        _throttle("nominatim", 1.0)
+        u = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+            {"q": query, "format": "json", "limit": 5, "addressdetails": 1,
+             "countrycodes": "id", "accept-language": "id"})
+        items = _http_get_json(u, timeout=5)
+        if not isinstance(items, list):
+            return []
+        for it in items:
+            name = it.get("display_name") or ""
+            lat, lon = it.get("lat"), it.get("lon")
+            if not (name and lat and lon):
+                continue
+            try:
+                flat, flon = float(lat), float(lon)
+            except (TypeError, ValueError):
+                continue
+            addr = it.get("address") or {}
+            place = (addr.get("city") or addr.get("town") or addr.get("village")
+                     or addr.get("state") or "")
+            road = addr.get("road") or ""
+            typ = f"{it.get('category', '')}/{it.get('type', '')}".strip("/")
+            meta = " · ".join(x for x in [typ, road, place] if x)
+            out.append({"title": name.split(",")[0][:90],
+                        "url": (f"https://www.openstreetmap.org/"
+                                f"?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}"),
+                        "snippet": (f"{meta} — {name}"[:300] if meta
+                                    else name[:300]),
+                        "source": "nominatim",
+                        # v0.13: vertical card tempat di frontend
+                        "kind": "place",
+                        "data": {"lat": flat, "lon": flon,
+                                 "display_name": name[:200], "type": typ}})
+    except Exception:
+        pass
+    return out
+
+
+def _web_musicbrainz(query: str) -> list[dict]:
+    """MusicBrainz — musik (rekaman). Resmi, tanpa key.
+
+    Wajib: fmt=json (default XML!) + UA deskriptif, max 1 req/detik."""
+    out: list[dict] = []
+    try:
+        _throttle("musicbrainz", 1.0)
+        u = "https://musicbrainz.org/ws/2/recording?" + urllib.parse.urlencode(
+            {"query": f'recording:"{query}"', "fmt": "json", "limit": 7})
+        for r in _http_get_json(u, timeout=5).get("recordings", []):
+            title = r.get("title") or ""
+            mbid = r.get("id") or ""
+            if not (title and mbid):
+                continue
+            artists = ", ".join(a.get("name", "")
+                                for a in (r.get("artist-credit") or []))
+            releases = r.get("releases") or []
+            album = releases[0].get("title") if releases else ""
+            meta = " · ".join(x for x in [artists, album] if x)
+            out.append({"title": title,
+                        "url": f"https://musicbrainz.org/recording/{mbid}",
+                        "snippet": (meta or "Rekaman MusicBrainz")[:300],
+                        "source": "musicbrainz"})
+    except Exception:
+        pass
+    return out
+
+
+# Mapping kode cuaca WMO -> Bahasa Indonesia (untuk Open-Meteo).
+_WMO_DESC = {
+    0: "Cerah", 1: "Cerah sebagian", 2: "Berawan sebagian", 3: "Mendung",
+    45: "Berkabut", 48: "Kabut es",
+    51: "Gerimis ringan", 53: "Gerimis", 55: "Gerimis lebat",
+    56: "Gerimis beku ringan", 57: "Gerimis beku",
+    61: "Hujan ringan", 63: "Hujan", 65: "Hujan lebat",
+    66: "Hujan beku ringan", 67: "Hujan beku",
+    71: "Salju ringan", 73: "Salju", 75: "Salju lebat",
+    77: "Butiran salju",
+    80: "Hujan rintik ringan", 81: "Hujan rintik", 82: "Hujan rintik lebat",
+    85: "Hujan salju ringan", 86: "Hujan salju lebat",
+    95: "Badai petir",
+    96: "Badai petir + hujan es ringan", 99: "Badai petir + hujan es",
+}
+
+
+def _weather_city(query: str) -> str:
+    """Ambil nama kota dari query cuaca: buang kata cuaca/waktu/preposisi."""
+    q = query.lower()
+    q = re.sub(r"\b(cuaca|weather|prakiraan|prakira|hujan|panas|dingin|suhu|temperature)\b", " ", q)
+    q = re.sub(r"\b(hari ini|besok|lusa|kemarin|minggu ini|sekarang|saat ini)\b", " ", q)
+    q = re.sub(r"\b(di|untuk|ke|sekitar|daerah|wilayah|kota|kabupaten|provinsi)\b", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
+
+def _web_openmeteo(query: str) -> list[dict]:
+    """Open-Meteo — cuaca TANPA key, tanpa signup. Geocoding nama kota
+    -> lat/lon, lalu forecast. Resmi, fair use."""
+    out: list[dict] = []
+    try:
+        city = _weather_city(query) or "jakarta"
+        gu = ("https://geocoding-api.open-meteo.com/v1/search?"
+              + urllib.parse.urlencode({"name": city, "count": 1,
+                                        "language": "id"}))
+        geo = (_http_get_json(gu, timeout=5).get("results") or [None])[0]
+        if not geo:
+            return []
+        lat, lon = geo.get("latitude"), geo.get("longitude")
+        name = geo.get("name") or city
+        country = geo.get("country") or ""
+        fu = ("https://api.open-meteo.com/v1/forecast?"
+              + urllib.parse.urlencode(
+                  {"latitude": lat, "longitude": lon,
+                   "current": "temperature_2m,relative_humidity_2m,"
+                              "apparent_temperature,weather_code,wind_speed_10m",
+                   "timezone": "auto"}))
+        cur = _http_get_json(fu, timeout=5).get("current") or {}
+        if "temperature_2m" not in cur:
+            return []
+        code = cur.get("weather_code")
+        desc = _WMO_DESC.get(code, f"Kode cuaca {code}")
+        temp = cur.get("temperature_2m")
+        data = {"temp_c": temp, "feels_like_c": cur.get("apparent_temperature"),
+                "desc": desc, "humidity": cur.get("relative_humidity_2m"),
+                "wind_ms": cur.get("wind_speed_10m"),
+                "city": name, "country": country}
+        loc = f"{name}, {country}" if country else name
+        out.append({"title": f"Cuaca {loc}: {temp}°C, {desc}",
+                    "url": (f"https://open-meteo.com/en/docs"
+                            f"#latitude={lat}&longitude={lon}"),
+                    "snippet": (f"{desc}, suhu {temp}°C (terasa "
+                                f"{cur.get('apparent_temperature')}°C), kelembapan "
+                                f"{cur.get('relative_humidity_2m')}%, angin "
+                                f"{cur.get('wind_speed_10m')} m/s — {loc}"),
+                    "source": "openmeteo", "kind": "weather", "data": data})
+    except Exception:
+        pass
+    return out
+
+
+def _web_lobsters(query: str) -> list[dict]:
+    """Lobsters — tech news. Tidak ada endpoint search resmi (verified) ->
+    ambil feed hottest.json lalu filter & rank sisi-server: token hits di
+    title/tags/description + score story."""
+    out: list[dict] = []
+    try:
+        toks = [t for t in re.findall(r"[a-z0-9_]+", query.lower()) if len(t) > 2]
+        if not toks:
+            return []
+        d = _http_get_json("https://lobste.rs/hottest.json", timeout=5)
+        stories = d if isinstance(d, list) else []
+        scored = []
+        for s in stories:
+            hay = " ".join([s.get("title") or "", s.get("description") or "",
+                            " ".join(s.get("tags") or [])]).lower()
+            hits = sum(1 for t in toks if t in hay)
+            if not hits:
+                continue
+            url = s.get("url") or f"https://lobste.rs/s/{s.get('short_id')}"
+            if not url.startswith("http"):
+                continue
+            score = hits * 10 + min(s.get("score") or 0, 100) / 20
+            snip = (s.get("description") or "")[:280] or (
+                f"{s.get('score', 0)} poin · "
+                f"{s.get('comment_count', 0)} komentar · Lobsters")
+            scored.append((score, {"title": s.get("title") or url,
+                                   "url": url, "snippet": snip,
+                                   "source": "lobsters"}))
+        scored.sort(key=lambda x: -x[0])
+        out = [r for _, r in scored[:7]]
+    except Exception:
+        pass
+    return out
+
+
+def _web_dbpedia(query: str) -> list[dict]:
+    """DBpedia SPARQL — enrichment/fallback knowledge. Template SPARQL statis
+    + LIMIT kecil (bukan generator SPARQL bebas). Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        term = re.sub(r'["\\]', "", query.strip().lower())[:60]
+        if not term:
+            return []
+        sparql = (
+            "SELECT ?s ?label ?abstract WHERE {"
+            " ?s rdfs:label ?label ."
+            " ?s dbo:abstract ?abstract ."
+            " FILTER (LANG(?label)='en' && LANG(?abstract)='en' &&"
+            f' CONTAINS(LCASE(?label),"{term}"))'
+            "} LIMIT 5")
+        u = "https://dbpedia.org/sparql?" + urllib.parse.urlencode(
+            {"query": sparql, "format": "json"})
+        bindings = (_http_get_json(u, timeout=5).get("results", {})
+                    .get("bindings", []))
+        for b in bindings:
+            label = (b.get("label") or {}).get("value") or ""
+            uri = (b.get("s") or {}).get("value") or ""
+            abstract = (b.get("abstract") or {}).get("value") or ""
+            if not (label and uri.startswith("http")):
+                continue
+            out.append({"title": label, "url": uri,
+                        "snippet": abstract[:300] or "Entitas DBpedia",
+                        "source": "dbpedia"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_tmdb(query: str) -> list[dict]:
+    """TMDB — film/TV. KEY-OPSIONAL: aktif hanya bila env TMDB_API_KEY di-set
+    (akun gratis, tanpa kartu kredit). Tanpa key -> [] diam-diam."""
+    key = os.environ.get("TMDB_API_KEY", "").strip()
+    if not key:
+        return []
+    out: list[dict] = []
+    try:
+        u = "https://api.themoviedb.org/3/search/multi?" + urllib.parse.urlencode(
+            {"api_key": key, "query": query, "language": "id-ID", "page": 1,
+             "include_adult": "false"})
+        for r in _http_get_json(u, timeout=5).get("results", []):
+            mt = r.get("media_type")
+            if mt not in ("movie", "tv"):
+                continue
+            rid = r.get("id")
+            title = r.get("title") or r.get("name") or ""
+            if not (rid and title):
+                continue
+            date = r.get("release_date") or r.get("first_air_date") or ""
+            year = date[:4] if date else ""
+            overview = r.get("overview") or "Tanpa sinopsis"
+            poster = r.get("poster_path") or ""
+            data = {"year": year, "rating": r.get("vote_average"),
+                    "overview": overview}
+            meta = " · ".join(x for x in
+                              [year, f"★ {r.get('vote_average')}",
+                               "Film" if mt == "movie" else "Serial TV"] if x)
+            out.append({"title": f"{title} ({year})" if year else title,
+                        "url": f"https://www.themoviedb.org/{mt}/{rid}",
+                        "snippet": (f"{meta} — {overview[:260]}" if meta
+                                    else overview[:300]),
+                        "source": "tmdb", "kind": "movie", "data": data,
+                        **({"image": f"https://image.tmdb.org/t/p/w500{poster}"}
+                           if poster else {})})
+            if len(out) >= 7:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _web_tavily(query: str) -> list[dict]:
+    """Tavily — mesin pencari general premium (PENGGANTI Brave di v0.13).
+
+    KEY-OPSIONAL via env TAVILY_API_KEY (paket gratis 'Researcher', tanpa
+    kartu kredit); tanpa key -> return [] diam-diam, engine tetap jalan.
+    POST JSON ke api.tavily.com/search. Brave di-blacklist permanen."""
+    key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not key:
+        return []
+    out: list[dict] = []
+    try:
+        d = _http_post_json(
+            "https://api.tavily.com/search",
+            {"api_key": key, "query": query, "search_depth": "basic",
+             "max_results": 7}, timeout=8)
+        for r in d.get("results", []):
+            url = r.get("url") or ""
+            title = r.get("title") or ""
+            if not (url.startswith("http") and title):
+                continue
+            out.append({"title": title, "url": url,
+                        "snippet": (r.get("content") or "Hasil web via Tavily")[:300],
+                        "source": "tavily"})
+    except Exception:
+        return []
+    return out
+
+
 def _web_slug(url: str) -> str:
     s = re.sub(r"^https?://(www\.)?", "", url.strip().lower())
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
@@ -1291,15 +1834,19 @@ def _web_slug(url: str) -> str:
 # atas, npm sedikit di bawah (netral = 1.0).
 _SOURCE_TRUST = {
     "wikipedia": 1.25, "wikidata": 1.20, "github": 1.20,
-    "brave": 1.15, "duckduckgo": 1.10, "openalex": 1.10, "arxiv": 1.10,
-    "pubmed": 1.10, "stackexchange": 1.10, "hackernews": 1.10,
+    "tavily": 1.15, "dbpedia": 1.15, "duckduckgo": 1.10,
+    "openalex": 1.10, "arxiv": 1.10, "pubmed": 1.10,
+    "stackexchange": 1.10, "hackernews": 1.10, "lobsters": 1.10,
+    "semanticscholar": 1.10, "crossref": 1.10, "tmdb": 1.10,
+    "openmeteo": 1.05, "nominatim": 1.05,
     "ddg_lite": 1.00, "qwant": 1.00, "openlibrary": 1.00, "archive": 1.00,
-    "npm": 0.90,
+    "musicbrainz": 1.00,
+    "npm": 0.90, "crates": 0.90, "packagist": 0.90, "dockerhub": 0.90,
 }
 
 
 def _web_rank(query: str, results: list[dict]) -> list[dict]:
-    """v0.12 re-rank presisi:
+    """v0.12 re-rank presisi, v0.13 filter coverage diperketat:
 
     1. whole-word match di judul >> substring di dalam kata lain
        ("lowkey" di "@devlowkey/..." hampir tak dihitung, whole-word dihitung
@@ -1308,7 +1855,12 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
     3. Coverage: berapa kata query yang cocok. Skor dikalikan
        (0.3 + 0.7*coverage) — hasil yang cocok SEMUA kata menang telak atas
        yang cuma cocok sebagian.
-    4. Query multi-kata dengan coverage 0 (tak ada kata cocok) DIBUANG.
+    4. v0.13 — NOL hasil > hasil salah. Query multi-kata dengan coverage
+       rendah DIBUANG:
+       - 2 kata: SEMUA kata wajib cocok (coverage 1.0). "nadhif aslam" ->
+         paket yang cuma cocok "aslam" adalah sampah -> buang.
+       - 3+ kata: minimal 2/3 kata cocok DAN kata pertama (paling signifikan)
+         wajib cocok.
     5. Bobot kepercayaan sumber (_SOURCE_TRUST).
     Recall query 1 kata dipertahankan: token tunggal yang cocok whole-word
     tetap menang (mis. "adiprmx" -> profil GitHub #1)."""
@@ -1323,8 +1875,9 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
         title = (r.get("title") or "").lower()
         snip = (r.get("snippet") or "").lower()
         matched = 0
+        matched_first = False
         s = 0.0
-        for t in toks:
+        for i, t in enumerate(toks):
             pat = patterns[t]
             wt = len(pat.findall(title))          # whole-word di judul
             ws = len(pat.findall(snip))           # whole-word di snippet
@@ -1332,11 +1885,20 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
             ss = snip.count(t) - ws               # substring saja di snippet
             if wt or ws:
                 matched += 1
+                if i == 0:
+                    matched_first = True
             s += (4.0 * min(wt, 3) + 2.0 * min(ws, 3)
                   + 0.2 * min(st, 5) + 0.1 * min(ss, 5))
         coverage = matched / len(toks)
-        if multi and matched == 0:
-            return None  # buang: tak ada satu kata pun yang benar-benar cocok
+        # v0.13: buang hasil yang tak cukup cocok — NOL hasil > hasil salah.
+        if multi:
+            if len(toks) == 2 and matched < 2:
+                return None  # 2 kata: semua kata WAJIB cocok
+            if len(toks) >= 3:
+                if not matched_first:
+                    return None  # kata pertama (paling signifikan) hilang
+                if coverage < 2 / 3:
+                    return None  # minimal 2/3 kata cocok
         if len(phrase) > 3:
             if phrase in title:
                 s += 60.0
@@ -1357,7 +1919,12 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
 
 def _route_backends(query: str) -> list:
     """Pilih backend yang relevan saja (v0.10) — jauh lebih cepat & hemat
-    rate-limit daripada memanggil semua 16 tiap query. Fallback: semua."""
+    rate-limit daripada memanggil semua tiap query. v0.13: 7-10 backend/query;
+    kategori baru (cuaca/tempat/film/musik/paper/paket/tech/knowledge) dengan
+    chain fallback: primer + cadangan jalan paralel dalam satu round; bila
+    primer 0 hasil/gagal, hasil cadangan otomatis dipakai (timeout kolektif
+    2.5 dtk tetap dijaga). Brave dihapus total (blacklist permanen) ->
+    digantikan Tavily (key-opsional, prioritas tinggi bila key ada)."""
     q = query.strip()
     ql = q.lower()
     # token mentah (tanpa buang stopwords) — kata tanya butuh dideteksi.
@@ -1375,27 +1942,63 @@ def _route_backends(query: str) -> list:
         "arxiv", "doi", "skripsi", "tesis", "disertasi", "kajian"}
     book_words = {
         "buku", "novel", "book", "ebook", "e-book", "komik", "manga"}
+    weather_words = {"cuaca", "weather", "prakiraan", "prakira"}
+    film_words = {"film", "movie", "movies", "sinopsis", "cast", "pemain",
+                  "sutradara", "director"}
+    music_words = {"lagu", "musik", "music", "song", "songs", "band",
+                   "album", "albums", "penyanyi", "vokal"}
+    rust_words = {"rust", "cargo", "crate", "crates"}
+    tech_words = {"startup", "devops", "linux", "teknologi", "programmer",
+                  "software", "opensource", "open source"}
+    place_re = re.compile(
+        r"\b(kafe|restoran|rumah makan|hotel|penginapan|dimana|alamat|peta)\b"
+        r"|\bdi [a-z]")
     general = [_web_ddg_lite, _web_qwant, _web_duckduckgo, _web_wikipedia]
+    # Tavily: tanpa key -> [] diam-diam (engine tetap jalan); bila key ada,
+    # kualitasnya bagus -> prioritas tinggi di chain general.
+    tavily = [_web_tavily]
     if _GH_USER_RE.match(q):
-        return [_web_github_user, _web_github, _web_ddg_lite, _web_qwant,
-                _web_wikipedia, _web_wikidata, _web_npm, _web_brave]
+        return [_web_github_user, _web_github, *tavily,
+                _web_ddg_lite, _web_qwant,
+                _web_wikipedia, _web_wikidata, _web_npm]
+    if toks & weather_words:
+        return [_web_openmeteo, *general, *tavily]
+    if toks & film_words:
+        film = ([_web_tmdb] if os.environ.get("TMDB_API_KEY", "").strip()
+                else [])
+        return [*film, *general, *tavily]  # wikipedia sudah di dalam general
+    if toks & music_words:
+        return [_web_musicbrainz, *general, *tavily]
+    if place_re.search(ql):
+        return [_web_nominatim, *general, *tavily]
     if toks & academic_words:
-        return [_web_openalex, _web_arxiv, _web_pubmed, _web_wikipedia,
-                *general, _web_brave]
+        # chain paper: semanticscholar -> openalex -> arxiv -> crossref
+        return [_web_semanticscholar, _web_openalex, _web_arxiv,
+                _web_crossref, _web_pubmed, *general, *tavily]
     if toks & book_words:
-        return [_web_openlibrary, _web_archive, _web_wikipedia,
-                *general, _web_brave]
-    if any(m in ql for m in code_markers):
+        return [_web_openlibrary, _web_archive, *general, *tavily]
+    if toks & rust_words:
+        # chain paket: crates (primer) + npm (cadangan umum)
+        return [_web_crates, _web_npm, _web_github, _web_stackexchange,
+                *general, *tavily]
+    if "composer" in ql or "php package" in ql or "packagist" in ql:
+        # chain paket: packagist (primer) + npm (cadangan umum)
+        return [_web_packagist, _web_npm, _web_github, _web_stackexchange,
+                *general, *tavily]
+    if "docker image" in ql or ("docker" in toks and "image" in toks):
+        return [_web_dockerhub, _web_github, _web_stackexchange,
+                *general, *tavily]
+    if any(m in ql for m in code_markers) or toks & tech_words:
         return [_web_stackexchange, _web_github, _web_npm, _web_hackernews,
-                *general, _web_brave]
+                _web_lobsters, *general, *tavily]
     if toks & question_words or ql.endswith("?"):
-        return [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
-                _web_stackexchange, _web_hackernews, _web_brave]
+        # chain knowledge: wikipedia -> wikidata -> dbpedia
+        return [_web_wikipedia, _web_wikidata, _web_dbpedia,
+                _web_duckduckgo, _web_ddg_lite, _web_qwant,
+                _web_stackexchange, _web_hackernews, *tavily]
     return [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
-            _web_hackernews, _web_stackexchange, _web_github,
-            _web_openalex, _web_arxiv, _web_pubmed,
-            _web_openlibrary, _web_archive, _web_npm, _web_wikidata,
-            _web_brave]
+            _web_hackernews, _web_stackexchange, _web_github, _web_npm,
+            _web_wikidata, *tavily]
 
 
 def unified_search(query: str, limit: int = 12) -> dict:
@@ -1438,7 +2041,7 @@ def web_search(query: str, limit: int = 10) -> dict:
     # kunci cache menyertakan versi engine -> otomatis invalid tiap upgrade,
     # jadi cache basi (mis. hasil kosong sebelum backend baru ada) tak dipakai.
     qn = f"v{VERSION}\x00{q.lower()}"
-    brave_on = bool(os.environ.get("BRAVE_API_KEY", "").strip())
+    tavily_on = bool(os.environ.get("TAVILY_API_KEY", "").strip())
     con = _connect()
     con.executescript(SCHEMA_WEB)
     row = con.execute("SELECT results_json, ts FROM web_cache WHERE q = ?", (qn,)).fetchone()
@@ -1449,7 +2052,7 @@ def web_search(query: str, limit: int = 10) -> dict:
         _log_event("search", query=q)
         return {"query": q, "results": results[:limit],
                 "sources": sorted({r["source"] for r in results}),
-                "cached": True, "brave": brave_on, "learned": 0,
+                "cached": True, "tavily": tavily_on, "learned": 0,
                 "backends_queried": 0}
     results: list[dict] = []
     backends = _route_backends(q)
@@ -1507,7 +2110,7 @@ def web_search(query: str, limit: int = 10) -> dict:
     con.close()
     return {"query": q, "results": uniq[:limit],
             "sources": sorted({r["source"] for r in uniq}),
-            "cached": False, "brave": brave_on, "learned": learned,
+            "cached": False, "tavily": tavily_on, "learned": learned,
             "backends_queried": len(backends)}
 
 
@@ -1565,12 +2168,21 @@ def application(environ, start_response):
         start_response("200 OK", [("Content-Length", "0"), *CORS])
         return [b""]
 
+    # v0.13 self-healing: migrasi judul internal lama, sekali per proses.
+    # Tak pernah menggagalkan request (idempotent, bounded, try/except).
+    try:
+        _self_heal_titles()
+    except Exception:
+        pass
+
     if path == "/health" and method == "GET":
         return _json(start_response, "OK",
                      {"status": "ok", "version": VERSION, "engine": ENGINE_NAME,
                       "web": True,
+                      # v0.13: brave DIHAPUS; tavily & tmdb hanya bila key di-set
                       "web_sources": WEB_SOURCES
-                      + (["brave"] if os.environ.get("BRAVE_API_KEY", "").strip() else [])})
+                      + (["tavily"] if os.environ.get("TAVILY_API_KEY", "").strip() else [])
+                      + (["tmdb"] if os.environ.get("TMDB_API_KEY", "").strip() else [])})
 
     if path == "/ready" and method == "GET":
         return _json(start_response, "OK", {"ready": True, "engine": ENGINE_NAME})
