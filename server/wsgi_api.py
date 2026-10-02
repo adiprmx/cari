@@ -39,6 +39,9 @@ Mesin pencari yang belajar sendiri:
       v0.9.2: hasil web membawa "image" (thumbnail Wikipedia via
       pageimages, avatar GitHub, cover buku Open Library); frontend
       menampilkan thumbnail, fallback ke favicon domain.
+      v0.10: router query — hanya backend relevan yang dipanggil
+      (username/code/akademik/buku/tanya/default); timeout 5 dtk;
+      limit per backend naik (7-8); respons sertakan backends_queried.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -73,7 +76,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.9.2"
+VERSION = "0.10.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -789,7 +792,7 @@ def reindex_full() -> dict:
 # (perlu api.search.brave.com lolos whitelist outbound).
 
 WEB_UA = {"User-Agent": "CARI/0.9 (personal search engine; +https://adiprmx.github.io/cari/)"}
-WEB_TIMEOUT = 10
+WEB_TIMEOUT = 5
 WEB_CACHE_TTL = 24 * 3600  # detik — hasil web mentah di-cache 1 hari
 
 SCHEMA_WEB = """
@@ -996,7 +999,7 @@ def _web_github(query: str) -> list[dict]:
                 "source": "github",
                 **({"image": it["avatar_url"]} if it.get("avatar_url") else {})})
         u = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
-            {"q": query, "per_page": 6, "sort": "stars", "order": "desc"})
+            {"q": query, "per_page": 8, "sort": "stars", "order": "desc"})
         d = _http_get_json(u)
         for it in d.get("items", []):
             if not it.get("html_url"):
@@ -1024,7 +1027,7 @@ def _web_ddg_lite(query: str) -> list[dict]:
     try:
         u = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode({"q": query})
         req = urllib.request.Request(u, headers={**WEB_UA, "Accept": "text/html"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             raw = r.read(300_000).decode("utf-8", "replace")
         for m in re.finditer(
                 r'<a[^>]*rel="nofollow"[^>]*href="//duckduckgo\.com/l/\?uddg=([^"&]+)[^"]*"[^>]*>(.*?)</a>',
@@ -1035,7 +1038,7 @@ def _web_ddg_lite(query: str) -> list[dict]:
                 out.append({"title": title, "url": url,
                             "snippet": "Hasil web via DuckDuckGo",
                             "source": "ddg_lite"})
-            if len(out) >= 6:
+            if len(out) >= 8:
                 break
     except Exception:
         pass
@@ -1048,7 +1051,7 @@ def _web_qwant(query: str) -> list[dict]:
     try:
         u = "https://api.qwant.com/v3/search/web?" + urllib.parse.urlencode(
             {"t": "web", "q": query, "locale": "id_ID", "count": 8, "safesearch": 1})
-        d = _http_get_json(u, timeout=10)
+        d = _http_get_json(u, timeout=5)
         items = d.get("data", {}).get("result", {}).get("items", []) or []
         for it in items:
             url = it.get("url") or ""
@@ -1059,7 +1062,7 @@ def _web_qwant(query: str) -> list[dict]:
             out.append({"title": title, "url": url,
                         "snippet": desc[:300] or "Hasil web via Qwant",
                         "source": "qwant"})
-            if len(out) >= 6:
+            if len(out) >= 8:
                 break
     except Exception:
         pass
@@ -1071,9 +1074,9 @@ def _web_openalex(query: str) -> list[dict]:
     out: list[dict] = []
     try:
         u = "https://api.openalex.org/works?" + urllib.parse.urlencode(
-            {"search": query, "per-page": 5,
+            {"search": query, "per-page": 7,
              "select": "id,doi,title,publication_year,cited_by_count,primary_location"})
-        for w in _http_get_json(u, timeout=10).get("results", []):
+        for w in _http_get_json(u, timeout=5).get("results", []):
             title = w.get("title") or ""
             if not title:
                 continue
@@ -1095,10 +1098,10 @@ def _web_arxiv(query: str) -> list[dict]:
     out: list[dict] = []
     try:
         u = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(
-            {"search_query": f'all:"{query}"', "start": 0, "max_results": 5,
+            {"search_query": f'all:"{query}"', "start": 0, "max_results": 7,
              "sortBy": "relevance", "sortOrder": "descending"})
         req = urllib.request.Request(u, headers=dict(WEB_UA))
-        with urllib.request.urlopen(req, timeout=12) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             raw = r.read(300_000)
         root = ET.fromstring(raw)
         ns = {"a": "http://www.w3.org/2005/Atom"}
@@ -1123,14 +1126,14 @@ def _web_pubmed(query: str) -> list[dict]:
     try:
         base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
         s = _http_get_json(base + "esearch.fcgi?" + urllib.parse.urlencode(
-            {"db": "pubmed", "term": query, "retmax": 5, "retmode": "json",
-             "sort": "relevance", "tool": "cari"}), timeout=10)
+            {"db": "pubmed", "term": query, "retmax": 7, "retmode": "json",
+             "sort": "relevance", "tool": "cari"}), timeout=5)
         ids = (s.get("esearchresult") or {}).get("idlist", [])
         if not ids:
             return []
         d = _http_get_json(base + "esummary.fcgi?" + urllib.parse.urlencode(
             {"db": "pubmed", "id": ",".join(ids), "retmode": "json",
-             "tool": "cari"}), timeout=10)
+             "tool": "cari"}), timeout=5)
         res = d.get("result", {})
         for i in res.get("uids", []):
             it = res.get(i) or {}
@@ -1152,9 +1155,9 @@ def _web_openlibrary(query: str) -> list[dict]:
     out: list[dict] = []
     try:
         u = "https://openlibrary.org/search.json?" + urllib.parse.urlencode(
-            {"q": query, "limit": 5,
+            {"q": query, "limit": 7,
              "fields": "key,title,author_name,first_publish_year,cover_i"})
-        for b in _http_get_json(u, timeout=10).get("docs", []):
+        for b in _http_get_json(u, timeout=5).get("docs", []):
             key, title = b.get("key") or "", b.get("title") or ""
             if not (key and title):
                 continue
@@ -1177,9 +1180,9 @@ def _web_archive(query: str) -> list[dict]:
     out: list[dict] = []
     try:
         params = [("q", query), ("fl[]", "identifier"), ("fl[]", "title"),
-                  ("fl[]", "description"), ("rows", 5), ("output", "json")]
+                  ("fl[]", "description"), ("rows", 7), ("output", "json")]
         u = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
-        docs = _http_get_json(u, timeout=12).get("response", {}).get("docs", [])
+        docs = _http_get_json(u, timeout=5).get("response", {}).get("docs", [])
         for it in docs:
             ident = it.get("identifier") or ""
             if not ident:
@@ -1201,8 +1204,8 @@ def _web_npm(query: str) -> list[dict]:
     out: list[dict] = []
     try:
         u = "https://registry.npmjs.org/-/v1/search?" + urllib.parse.urlencode(
-            {"text": query, "size": 5})
-        for o in _http_get_json(u, timeout=10).get("objects", []):
+            {"text": query, "size": 7})
+        for o in _http_get_json(u, timeout=5).get("objects", []):
             p = o.get("package") or {}
             name = p.get("name") or ""
             if not name:
@@ -1223,8 +1226,8 @@ def _web_wikidata(query: str) -> list[dict]:
     try:
         u = "https://www.wikidata.org/w/api.php?" + urllib.parse.urlencode(
             {"action": "wbsearchentities", "search": query, "language": "id",
-             "uselang": "id", "format": "json", "limit": 5, "formatversion": "2"})
-        for it in _http_get_json(u, timeout=10).get("search", []):
+             "uselang": "id", "format": "json", "limit": 7, "formatversion": "2"})
+        for it in _http_get_json(u, timeout=5).get("search", []):
             qid = it.get("id") or ""
             if not qid:
                 continue
@@ -1262,6 +1265,49 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
     return sorted(results, key=score, reverse=True)
 
 
+def _route_backends(query: str) -> list:
+    """Pilih backend yang relevan saja (v0.10) — jauh lebih cepat & hemat
+    rate-limit daripada memanggil semua 16 tiap query. Fallback: semua."""
+    q = query.strip()
+    ql = q.lower()
+    # token mentah (tanpa buang stopwords) — kata tanya butuh dideteksi.
+    toks = set(re.findall(r"[a-z0-9_]+", ql))
+    question_words = {
+        "apa", "apakah", "siapa", "kapan", "dimana", "di mana", "bagaimana",
+        "kenapa", "mengapa", "berapa", "cara", "what", "who", "when",
+        "where", "why", "how", "which", "is", "are", "do", "does", "?"}
+    code_markers = (
+        "error", "exception", "traceback", "import ", "def ", "function",
+        "class ", "npm", "pip install", "debug", "bug", "compile",
+        "syntax", "undefined", "nullpointer")
+    academic_words = {
+        "paper", "jurnal", "journal", "penelitian", "research", "studi",
+        "arxiv", "doi", "skripsi", "tesis", "disertasi", "kajian"}
+    book_words = {
+        "buku", "novel", "book", "ebook", "e-book", "komik", "manga"}
+    general = [_web_ddg_lite, _web_qwant, _web_duckduckgo, _web_wikipedia]
+    if _GH_USER_RE.match(q):
+        return [_web_github_user, _web_github, _web_ddg_lite, _web_qwant,
+                _web_wikipedia, _web_wikidata, _web_npm, _web_brave]
+    if toks & academic_words:
+        return [_web_openalex, _web_arxiv, _web_pubmed, _web_wikipedia,
+                *general, _web_brave]
+    if toks & book_words:
+        return [_web_openlibrary, _web_archive, _web_wikipedia,
+                *general, _web_brave]
+    if any(m in ql for m in code_markers):
+        return [_web_stackexchange, _web_github, _web_npm, _web_hackernews,
+                *general, _web_brave]
+    if toks & question_words or ql.endswith("?"):
+        return [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
+                _web_stackexchange, _web_hackernews, _web_brave]
+    return [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
+            _web_hackernews, _web_stackexchange, _web_github,
+            _web_openalex, _web_arxiv, _web_pubmed,
+            _web_openlibrary, _web_archive, _web_npm, _web_wikidata,
+            _web_brave]
+
+
 def web_search(query: str, limit: int = 10) -> dict:
     q = query.strip()
     # kunci cache menyertakan versi engine -> otomatis invalid tiap upgrade,
@@ -1278,13 +1324,10 @@ def web_search(query: str, limit: int = 10) -> dict:
         _log_event("search", query=q)
         return {"query": q, "results": results[:limit],
                 "sources": sorted({r["source"] for r in results}),
-                "cached": True, "brave": brave_on, "learned": 0}
+                "cached": True, "brave": brave_on, "learned": 0,
+                "backends_queried": 0}
     results: list[dict] = []
-    backends = [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
-                _web_hackernews, _web_stackexchange, _web_github,
-                _web_github_user,
-                _web_openalex, _web_arxiv, _web_pubmed, _web_openlibrary,
-                _web_archive, _web_npm, _web_wikidata, _web_brave]
+    backends = _route_backends(q)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(backends)) as ex:
         futs = [ex.submit(fn, q) for fn in backends]
         for f in concurrent.futures.as_completed(futs):
@@ -1328,7 +1371,8 @@ def web_search(query: str, limit: int = 10) -> dict:
     con.close()
     return {"query": q, "results": uniq[:limit],
             "sources": sorted({r["source"] for r in uniq}),
-            "cached": False, "brave": brave_on, "learned": learned}
+            "cached": False, "brave": brave_on, "learned": learned,
+            "backends_queried": len(backends)}
 
 
 # ------------------------------------------------------------- WSGI app
