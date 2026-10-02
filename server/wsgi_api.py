@@ -42,6 +42,8 @@ Mesin pencari yang belajar sendiri:
       v0.10: router query — hanya backend relevan yang dipanggil
       (username/code/akademik/buku/tanya/default); timeout 5 dtk;
       limit per backend naik (7-8); respons sertakan backends_queried.
+      v0.11: GET /search/all — cari lokal + web SEKALIGUS (paralel),
+      satu respons {web, local}; tab Lokal/Web dihapus dari UI.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -76,7 +78,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1308,6 +1310,41 @@ def _route_backends(query: str) -> list:
             _web_brave]
 
 
+def unified_search(query: str, limit: int = 12) -> dict:
+    """v0.11: cari di index lokal + web SEKALIGUS (paralel). Satu request,
+    satu respons — frontend tak perlu tab Lokal/Web lagi."""
+    q = query.strip()
+    web_res: dict = {}
+    local_hits: list = []
+
+    def run_web():
+        try:
+            web_res.update(web_search(q, limit))
+        except Exception:
+            pass
+
+    def run_local():
+        try:
+            local_hits.extend(search(q, limit=limit, log=False))
+        except Exception:
+            pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(run_web)
+        f2 = ex.submit(run_local)
+        concurrent.futures.wait([f1, f2])
+
+    return {
+        "query": q,
+        "web": web_res.get("results", []),
+        "local": local_hits,
+        "sources": web_res.get("sources", []),
+        "cached": web_res.get("cached", False),
+        "learned": web_res.get("learned", 0),
+        "backends_queried": web_res.get("backends_queried", 0),
+    }
+
+
 def web_search(query: str, limit: int = 10) -> dict:
     q = query.strip()
     # kunci cache menyertakan versi engine -> otomatis invalid tiap upgrade,
@@ -1478,6 +1515,23 @@ def application(environ, start_response):
         except Exception as e:
             return _json(start_response, "Bad Gateway",
                          {"detail": f"Web search gagal: {e}"}, 502)
+
+    # --- v0.11 Unified Search: lokal + web sekaligus, tanpa tab ---
+    if path == "/search/all" and method == "GET":
+        qp = _query_params(environ)
+        q = qp.get("q", "").strip()
+        if not q:
+            return _json(start_response, "Bad Request",
+                         {"detail": "parameter q wajib diisi"}, 400)
+        try:
+            limit = max(1, min(int(qp.get("limit", "12")), 20))
+        except (TypeError, ValueError):
+            limit = 12
+        try:
+            return _json(start_response, "OK", unified_search(q, limit))
+        except Exception as e:
+            return _json(start_response, "Bad Gateway",
+                         {"detail": f"Pencarian gagal: {e}"}, 502)
 
     if path == "/documents" and method == "POST":
         body = _read_json(environ)
