@@ -32,6 +32,10 @@ Mesin pencari yang belajar sendiri:
       PubMed (medis), Open Library (buku), Internet Archive (arsip),
       npm (paket JS), Wikidata (entitas). Semua berjalan paralel;
       yang ke-block whitelist diam-diam dilewati (try/except per backend).
+      v0.9.1: lookup profil GitHub langsung (GET /users/{u}, core API
+      60 req/jam — jauh lebih longgar dari Search API 10 req/mnt di IP
+      bersama) agar query username 1 kata tetap ketemu saat Search
+      API ke-rate-limit.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -66,7 +70,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -928,6 +932,36 @@ WEB_SOURCES = ["wikipedia", "duckduckgo", "ddg_lite", "qwant", "hackernews",
 _GITHUB_BACKOFF_UNTIL = 0.0
 
 
+# Pola username GitHub yang valid (1 token, tanpa spasi).
+_GH_USER_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$")
+
+
+def _web_github_user(query: str) -> list[dict]:
+    """Lookup profil GitHub langsung via core API (GET /users/{u}).
+
+    Beda bucket rate-limit dari Search API: core 60 req/jam/IP vs search
+    10 req/mnt/IP (dipakai rame-rame di server gratisan). Jadi query
+    username 1 kata tetap ketemu walau Search API lagi ke-rate-limit."""
+    q = query.strip()
+    if not _GH_USER_RE.match(q):
+        return []
+    try:
+        d = _http_get_json(f"https://api.github.com/users/{q}", timeout=8)
+        if not d.get("html_url"):
+            return []
+        bio = d.get("bio") or d.get("company") or d.get("location") or ""
+        meta = " · ".join(x for x in
+                          [bio,
+                           f"{d.get('public_repos', 0)} repo publik",
+                           f"{d.get('followers', 0)} followers"] if x)
+        return [{"title": f"{d.get('login')} (GitHub)",
+                 "url": d["html_url"],
+                 "snippet": meta or "Profil GitHub",
+                 "source": "github"}]
+    except Exception:
+        return []
+
+
 def _web_github(query: str) -> list[dict]:
     """GitHub user + repo search. Resmi, tanpa key (limit anonim 10 req/mnt).
 
@@ -1224,6 +1258,7 @@ def web_search(query: str, limit: int = 10) -> dict:
     results: list[dict] = []
     backends = [_web_wikipedia, _web_duckduckgo, _web_ddg_lite, _web_qwant,
                 _web_hackernews, _web_stackexchange, _web_github,
+                _web_github_user,
                 _web_openalex, _web_arxiv, _web_pubmed, _web_openlibrary,
                 _web_archive, _web_npm, _web_wikidata, _web_brave]
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(backends)) as ex:
