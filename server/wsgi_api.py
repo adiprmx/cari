@@ -31,7 +31,10 @@ Mesin pencari yang belajar sendiri:
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
-    * Hasil mentah di-cache 24 jam (tabel web_cache).
+    * Hasil mentah di-cache 24 jam (tabel web_cache, v0.8.3: kunci cache
+      berversi -> otomatis invalid tiap upgrade; hasil kosong tidak di-cache).
+    * GitHub backend punya backoff 10 menit saat kena 403/429 (IP gratisan
+      dipakai bersama, rawan rate-limit).
     * Siap Brave Search API: cukup set env BRAVE_API_KEY di WSGI config,
       backend brave ikut dipakai (perlu api.search.brave.com di-whitelist).
 
@@ -58,7 +61,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -900,8 +903,18 @@ def _web_stackexchange(query: str) -> list[dict]:
 WEB_SOURCES = ["wikipedia", "duckduckgo", "hackernews", "stackexchange", "github"]
 
 
+# Backoff GitHub saat kena rate-limit (403/429) di IP bersama.
+_GITHUB_BACKOFF_UNTIL = 0.0
+
+
 def _web_github(query: str) -> list[dict]:
-    """GitHub user + repo search. Resmi, tanpa key (limit anonim 10 req/mnt)."""
+    """GitHub user + repo search. Resmi, tanpa key (limit anonim 10 req/mnt).
+
+    IP gratisan dipakai rame-rame -> kalau kena 403/429, backoff 10 menit
+    agar tidak menghambat pencarian lain."""
+    global _GITHUB_BACKOFF_UNTIL
+    if time.time() < _GITHUB_BACKOFF_UNTIL:
+        return []
     out: list[dict] = []
     try:
         u = "https://api.github.com/search/users?" + urllib.parse.urlencode(
@@ -928,8 +941,12 @@ def _web_github(query: str) -> list[dict]:
                 "snippet": (it.get("description") or "Repositori GitHub") +
                             f" · ★ {it.get('stargazers_count', 0)}",
                 "source": "github"})
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            _GITHUB_BACKOFF_UNTIL = time.time() + 600
+        return []
     except Exception:
-        pass
+        return []
     return out[:10]
 
 
@@ -952,7 +969,9 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
 
 def web_search(query: str, limit: int = 10) -> dict:
     q = query.strip()
-    qn = q.lower()
+    # kunci cache menyertakan versi engine -> otomatis invalid tiap upgrade,
+    # jadi cache basi (mis. hasil kosong sebelum backend baru ada) tak dipakai.
+    qn = f"v{VERSION}\x00{q.lower()}"
     brave_on = bool(os.environ.get("BRAVE_API_KEY", "").strip())
     con = _connect()
     con.executescript(SCHEMA_WEB)
@@ -982,9 +1001,12 @@ def web_search(query: str, limit: int = 10) -> dict:
             seen.add(u)
             uniq.append(r)
     uniq = uniq[:max(limit * 2, 20)]
-    con.execute("INSERT OR REPLACE INTO web_cache(q, results_json, ts) VALUES (?,?,?)",
-                (qn, json.dumps(uniq, ensure_ascii=False), now))
-    con.commit()
+    # jangan cache hasil kosong: backend bisa pulih (mis. rate-limit reda),
+    # dan hasil kosong yang di-cache menutupi hasil baru selama 24 jam.
+    if uniq:
+        con.execute("INSERT OR REPLACE INTO web_cache(q, results_json, ts) VALUES (?,?,?)",
+                    (qn, json.dumps(uniq, ensure_ascii=False), now))
+        con.commit()
     # --- belajar: index permanen ke database lokal (skip kalau sudah ada) ---
     learned = 0
     for r in uniq:
