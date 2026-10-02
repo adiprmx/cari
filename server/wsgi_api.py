@@ -23,10 +23,10 @@ Mesin pencari yang belajar sendiri:
     POST /reindex untuk rebuild penuh manual, POST /learn untuk
     "belajar ulang" dari seluruh event klik (dipanggil via scheduled task
     harian: curl -X POST -H "X-API-Key: ..." https://.../learn).
-  Pilar 4 — Web Mode / metasearch (v0.8):
-    * GET /web/search?q=... : cari di web lewat backend resmi tanpa API key
-      (Wikipedia API + DuckDuckGo Instant Answer — keduanya lolos whitelist
-      outbound PythonAnywhere gratis).
+  Pilar 4 — Web Mode / metasearch (v0.8+):
+    * GET /web/search?q=... : cari di web lewat backend resmi tanpa API key:
+      Wikipedia, DuckDuckGo Instant Answer, Hacker News (Algolia),
+      Stack Exchange — semuanya lolos whitelist outbound PythonAnywhere.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -57,7 +57,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -852,6 +852,53 @@ def _web_brave(query: str) -> list[dict]:
         return []
 
 
+def _web_hackernews(query: str) -> list[dict]:
+    """Hacker News via Algolia API. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://hn.algolia.com/api/v1/search?" + urllib.parse.urlencode(
+            {"query": query, "tags": "story", "hitsPerPage": 8})
+        d = _http_get_json(u)
+        for h in d.get("hits", []):
+            title = h.get("title") or ""
+            if not title:
+                continue
+            url = h.get("url") or \
+                f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+            out.append({
+                "title": title, "url": url,
+                "snippet": (f"{h.get('points', 0)} poin · "
+                            f"{h.get('num_comments', 0)} komentar · Hacker News"),
+                "source": "hackernews"})
+    except Exception:
+        pass
+    return out
+
+
+def _web_stackexchange(query: str) -> list[dict]:
+    """Stack Exchange API (Stack Overflow). Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://api.stackexchange.com/2.3/search/advanced?" + urllib.parse.urlencode(
+            {"order": "desc", "sort": "relevance", "q": query,
+             "site": "stackoverflow", "pagesize": 8})
+        d = _http_get_json(u)
+        for it in d.get("items", []):
+            ans = "terjawab" if it.get("is_answered") else "belum terjawab"
+            out.append({
+                "title": htmlmod.unescape(it.get("title", "")),
+                "url": it.get("link", ""),
+                "snippet": (f"{ans} · {it.get('answer_count', 0)} jawaban · "
+                            f"skor {it.get('score', 0)} · Stack Overflow"),
+                "source": "stackexchange"})
+    except Exception:
+        pass
+    return out
+
+
+WEB_SOURCES = ["wikipedia", "duckduckgo", "hackernews", "stackexchange"]
+
+
 def _web_slug(url: str) -> str:
     s = re.sub(r"^https?://(www\.)?", "", url.strip().lower())
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
@@ -874,8 +921,9 @@ def web_search(query: str, limit: int = 10) -> dict:
                 "sources": sorted({r["source"] for r in results}),
                 "cached": True, "brave": brave_on, "learned": 0}
     results: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         futs = [ex.submit(_web_wikipedia, q), ex.submit(_web_duckduckgo, q),
+                ex.submit(_web_hackernews, q), ex.submit(_web_stackexchange, q),
                 ex.submit(_web_brave, q)]
         for f in concurrent.futures.as_completed(futs):
             try:
@@ -973,7 +1021,7 @@ def application(environ, start_response):
         return _json(start_response, "OK",
                      {"status": "ok", "version": VERSION, "engine": ENGINE_NAME,
                       "web": True,
-                      "web_sources": ["wikipedia", "duckduckgo"]
+                      "web_sources": WEB_SOURCES
                       + (["brave"] if os.environ.get("BRAVE_API_KEY", "").strip() else [])})
 
     if path == "/ready" and method == "GET":
