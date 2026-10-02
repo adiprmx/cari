@@ -54,6 +54,12 @@ Mesin pencari yang belajar sendiri:
       paper/paket/tech/knowledge) 7-10 backend/query; chain fallback
       primer->cadangan per kategori; Brave DIHAPUS TOTAL & BLACKLIST
       permanen (paid/wajib kartu kredit) -> digantikan Tavily.
+      v0.13.1 "Bersih & Nama": filter coverage (aturan yang SAMA dengan web)
+      untuk hasil lokal di /search & /search/all (NOL hasil > hasil salah);
+      absolute path server tak lagi diserialisasi ke frontend — diganti label
+      sumber manusiawi (mis. "npm", "DuckDuckGo Lite"); GitHub username
+      discovery: kandidat username dari gabungan token query ("adip"+"rmx"
+      -> "adiprmx"), boost relevansi SEDANG, cache 6 jam, ikut budget 2.5 dtk.
     * Setiap hasil web OTOMATIS di-index permanen ke database lokal
       (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
       mesin yang benar-benar belajar sendiri.
@@ -92,7 +98,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -563,7 +569,8 @@ def search(query: str, limit: int = 10, log: bool = True) -> list[dict]:
         hits.append({
             "doc_id": r["doc_id"],
             "title": r["title"],
-            "path": r["path"],
+            # v0.13.1: absolute path tak lagi diserialisasi — label saja.
+            "source": _local_source_label(r["path"]),
             "chunk": r["n"],
             "score": round(score, 3),
             "snippet": r["snip"],
@@ -571,6 +578,8 @@ def search(query: str, limit: int = 10, log: bool = True) -> list[dict]:
             "meta": {"clicks": b} if b else {},
         })
     hits.sort(key=lambda h: -h["score"])
+    # v0.13.1: filter coverage (aturan SAMA dengan web) — NOL hasil > salah.
+    hits = _filter_local_coverage(query, hits)
     hits = hits[:limit]
     if log:
         _log_event("search", query=query)
@@ -704,7 +713,9 @@ def related(doc_id: int, limit: int = 5) -> list[dict]:
             continue
         jacc = inter / len(kw | k2)
         scored.append((jacc, {"doc_id": r["doc_id"], "title": r["title"],
-                              "path": r["path"], "score": round(jacc, 3),
+                              # v0.13.1: tanpa absolute path — label saja.
+                              "source": _local_source_label(r["path"]),
+                              "score": round(jacc, 3),
                               "summary": r["summary"][:200]}))
     scored.sort(key=lambda x: -x[0])
     return [s for _, s in scored[:limit]]
@@ -916,7 +927,7 @@ def reindex_full() -> dict:
 # (paket gratis 'Researcher', tanpa kartu kredit; perlu api.tavily.com lolos
 # whitelist outbound). Brave di-blacklist permanen (butuh CC) — dihapus total.
 
-WEB_UA = {"User-Agent": "CARI/0.13 (personal search engine; +https://adiprmx.github.io/cari/)"}
+WEB_UA = {"User-Agent": "CARI/0.13.1 (personal search engine; +https://adiprmx.github.io/cari/)"}
 WEB_TIMEOUT = 5
 # v0.12: batas kumpul hasil backend per query — jangan tunggu backend yang
 # lambat; ambil yang sudah selesai, sisanya dibatalkan. Target total <3 dtk.
@@ -1164,6 +1175,112 @@ def _web_github(query: str) -> list[dict]:
     except Exception:
         return []
     return out[:10]
+
+
+# --------------------------------- v0.13.1 GitHub username discovery
+# Cache profil (hemat jatah 60 req/jam/IP core API): hit 6 jam, miss 1 jam.
+_GH_USER_CACHE: dict[str, tuple[float, dict | None]] = {}
+_GH_USER_CACHE_TTL = 6 * 3600
+_GH_USER_CACHE_TTL_MISS = 3600
+
+
+def _username_candidates(query: str, maxn: int = 3) -> list[str]:
+    """Kandidat username GitHub dari query multi-kata: token alfanumerik
+    (>=3 char, bukan stopword/angka) + gabungan PASANGAN token bersebelahan
+    — mis. "adip"+"rmx" -> "adiprmx". Maks ~3 kandidat: gabungan terpanjang
+    dulu, lalu token tunggal paling unik (terpanjang)."""
+    try:
+        toks = [t for t in re.findall(r"[a-z0-9]+", query.lower())
+                if len(t) >= 3 and not t.isdigit() and t not in STOPWORDS]
+        if len(toks) < 2:
+            return []  # 1 kata ditangani _web_github_user via router
+        cands: list[str] = []
+        pairs = ["".join(toks[i:i + 2]) for i in range(len(toks) - 1)]
+        for s in sorted(pairs, key=len, reverse=True):
+            if _GH_USER_RE.match(s) and s not in cands:
+                cands.append(s)
+        for t in sorted(toks, key=len, reverse=True):
+            if _GH_USER_RE.match(t) and t not in cands:
+                cands.append(t)
+        return cands[:maxn]
+    except Exception:
+        return []
+
+
+def _web_github_user_cached(candidate: str) -> dict | None:
+    """GET /users/{candidate} lewat cache (jangan panggil berulang untuk
+    kandidat sama). Kembalikan dict profil bila 200 + html_url, else None.
+    Ikut backoff GitHub global: skip total bila rate-limit sedang aktif."""
+    global _GITHUB_BACKOFF_UNTIL
+    try:
+        now = time.time()
+        hit = _GH_USER_CACHE.get(candidate)
+        if hit:
+            ts, prof = hit
+            ttl = _GH_USER_CACHE_TTL if prof else _GH_USER_CACHE_TTL_MISS
+            if now - ts < ttl:
+                return prof
+        if now < _GITHUB_BACKOFF_UNTIL:
+            return None
+        prof = None
+        try:
+            d = _http_get_json(f"https://api.github.com/users/{candidate}",
+                               timeout=5)
+            if d.get("html_url"):
+                prof = d
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                _GITHUB_BACKOFF_UNTIL = now + 600
+            prof = None
+        except Exception:
+            prof = None
+        _GH_USER_CACHE[candidate] = (now, prof)
+        return prof
+    except Exception:
+        return None
+
+
+def _web_github_discover(query: str) -> list[dict]:
+    """Username discovery untuk query multi-kata: coba kandidat username
+    dari gabungan token query via core API yang murah. Hasil dapat boost
+    SEDANG di _web_rank (bukan otomatis #1 bila kecocokan lemah).
+    Aman: <=3 kandidat, cache, skip saat backoff aktif, try/except per
+    kandidat."""
+    out: list[dict] = []
+    try:
+        cands = _username_candidates(query)
+        if not cands:
+            return []
+        qtoks = [t for t in re.findall(r"[a-z0-9]+", query.lower())
+                 if len(t) >= 3]
+        for cand in cands:
+            try:
+                prof = _web_github_user_cached(cand)
+            except Exception:
+                continue
+            if not prof:
+                continue
+            login = str(prof.get("login") or "").lower()
+            n_hits = sum(1 for t in qtoks if t in login)
+            bio = prof.get("bio") or prof.get("company") or \
+                prof.get("location") or ""
+            meta = " · ".join(x for x in
+                              [bio,
+                               f"{prof.get('public_repos', 0)} repo publik",
+                               f"{prof.get('followers', 0)} followers"] if x)
+            out.append({
+                "title": f"{prof.get('login')} (GitHub)",
+                "url": prof["html_url"],
+                "snippet": meta or "Profil GitHub",
+                "source": "github",
+                "_discover": True,   # internal: dibersihkan di web_search
+                "_hits": n_hits,     # sebelum respons JSON dikirim
+                **({"image": prof["avatar_url"]}
+                   if prof.get("avatar_url") else {}),
+            })
+    except Exception:
+        return []
+    return out
 
 
 def _web_ddg_lite(query: str) -> list[dict]:
@@ -1845,6 +1962,110 @@ _SOURCE_TRUST = {
 }
 
 
+# ------------------------------------------------- v0.13.1 "Bersih & Nama"
+def _query_tokens(query: str) -> list[str]:
+    """Token query untuk filter coverage (definisi tunggal, dipakai web &
+    lokal — sebelumnya inline di _web_rank)."""
+    return [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
+
+
+def _coverage_gate(n: int, matched: int, matched_first: bool) -> bool:
+    """Aturan tunggal NOL-hasil > hasil-salah (dipakai web & lokal):
+    2 kata -> SEMUA kata wajib cocok; 3+ kata -> kata pertama wajib cocok
+    DAN minimal 2/3 kata cocok."""
+    if n <= 1:
+        return True
+    if n == 2:
+        return matched >= 2
+    return matched_first and matched / n >= 2 / 3
+
+
+def _coverage_ok(toks: list[str], title: str, snippet: str) -> bool:
+    """Gate coverage untuk satu hasil: 'cocok' = whole-word di judul/snippet
+    (definisi identik dengan _web_rank)."""
+    n = len(toks)
+    if n <= 1:
+        return True
+    title = (title or "").lower()
+    snip = (snippet or "").lower()
+    matched = 0
+    matched_first = False
+    for i, t in enumerate(toks):
+        pat = r"\b" + re.escape(t) + r"\b"
+        if re.search(pat, title) or re.search(pat, snip):
+            matched += 1
+            if i == 0:
+                matched_first = True
+    return _coverage_gate(n, matched, matched_first)
+
+
+def _filter_local_coverage(query: str, hits: list[dict]) -> list[dict]:
+    """v0.13.1: terapkan filter coverage (aturan SAMA dengan web) ke hasil
+    lokal. Tiap hit terisolasi try/except: error filter -> hit diloloskan,
+    bukan dibuang."""
+    try:
+        toks = _query_tokens(query)
+        if len(toks) <= 1:
+            return hits
+        out = []
+        for h in hits:
+            try:
+                ok = _coverage_ok(toks, h.get("title"), h.get("snippet"))
+            except Exception:
+                ok = True
+            if ok:
+                out.append(h)
+        return out
+    except Exception:
+        return hits
+
+
+# label manusiawi per sumber backend (pengganti absolute path di respons)
+_SOURCE_LABEL = {
+    "wikipedia": "Wikipedia", "wikidata": "Wikidata", "github": "GitHub",
+    "tavily": "Tavily", "dbpedia": "DBpedia", "duckduckgo": "DuckDuckGo",
+    "ddg_lite": "DuckDuckGo Lite", "qwant": "Qwant",
+    "hackernews": "Hacker News", "lobsters": "Lobsters",
+    "stackexchange": "Stack Exchange", "openalex": "OpenAlex",
+    "arxiv": "arXiv", "pubmed": "PubMed",
+    "semanticscholar": "Semantic Scholar", "crossref": "Crossref",
+    "openlibrary": "Open Library", "archive": "Internet Archive",
+    "npm": "npm", "crates": "crates.io", "packagist": "Packagist",
+    "dockerhub": "Docker Hub", "nominatim": "OpenStreetMap",
+    "musicbrainz": "MusicBrainz", "openmeteo": "Open-Meteo", "tmdb": "TMDB",
+}
+
+
+def _local_source_label(path: str) -> str:
+    """v0.13.1: label sumber manusiawi untuk hasil lokal.
+
+    JANGAN PERNAH serialisasi absolute path server ke frontend — path
+    internal tetap tersimpan di DB, tapi respons JSON hanya membawa label."""
+    try:
+        base = os.path.basename(path or "")
+        m = re.match(r"^web-([a-z0-9_]+)-", base)
+        if m:
+            src = m.group(1)
+            return _SOURCE_LABEL.get(src,
+                                     src.replace("_", " ").title() or "Arsip")
+        return "Arsip pribadi" if base else "Arsip"
+    except Exception:
+        return "Arsip"
+
+
+def _strip_internal(results: list[dict]) -> list[dict]:
+    """v0.13.1: buang kunci internal (awalan '_', mis. _discover/_hits)
+    sebelum hasil web dikirim sebagai JSON."""
+    cleaned = []
+    for r in results:
+        try:
+            cleaned.append({k: v for k, v in r.items()
+                            if not str(k).startswith("_")})
+        except Exception:
+            cleaned.append(r)
+    return cleaned
+
+
 def _web_rank(query: str, results: list[dict]) -> list[dict]:
     """v0.12 re-rank presisi, v0.13 filter coverage diperketat:
 
@@ -1864,7 +2085,7 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
     5. Bobot kepercayaan sumber (_SOURCE_TRUST).
     Recall query 1 kata dipertahankan: token tunggal yang cocok whole-word
     tetap menang (mis. "adiprmx" -> profil GitHub #1)."""
-    toks = [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
+    toks = _query_tokens(query)
     if not toks:
         return list(results)  # tak ada token berarti -> urutan backend saja
     phrase = " ".join(toks)
@@ -1872,6 +2093,15 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
     patterns = {t: re.compile(r"\b" + re.escape(t) + r"\b") for t in toks}
 
     def score(r: dict) -> float | None:
+        # v0.13.1: profil dari username discovery — boost SEDANG.
+        # Lolos gate coverage (memang dirancang menemukan yang tak cocok
+        # harfiah); skor dibatasi di tengah papan, tak otomatis #1.
+        if r.get("_discover"):
+            try:
+                n_hits = max(int(r.get("_hits") or 1), 1)
+            except (TypeError, ValueError):
+                n_hits = 1
+            return min(10.0 * n_hits, 30.0)
         title = (r.get("title") or "").lower()
         snip = (r.get("snippet") or "").lower()
         matched = 0
@@ -1890,15 +2120,10 @@ def _web_rank(query: str, results: list[dict]) -> list[dict]:
             s += (4.0 * min(wt, 3) + 2.0 * min(ws, 3)
                   + 0.2 * min(st, 5) + 0.1 * min(ss, 5))
         coverage = matched / len(toks)
-        # v0.13: buang hasil yang tak cukup cocok — NOL hasil > hasil salah.
-        if multi:
-            if len(toks) == 2 and matched < 2:
-                return None  # 2 kata: semua kata WAJIB cocok
-            if len(toks) >= 3:
-                if not matched_first:
-                    return None  # kata pertama (paling signifikan) hilang
-                if coverage < 2 / 3:
-                    return None  # minimal 2/3 kata cocok
+        # v0.13: buang hasil yang tak cukup cocok — NOL hasil > hasil salah
+        # (aturan tunggal di _coverage_gate; dipakai web & lokal).
+        if multi and not _coverage_gate(len(toks), matched, matched_first):
+            return None
         if len(phrase) > 3:
             if phrase in title:
                 s += 60.0
@@ -2050,12 +2275,16 @@ def web_search(query: str, limit: int = 10) -> dict:
         con.close()
         results = _web_rank(q, json.loads(row[0]))
         _log_event("search", query=q)
-        return {"query": q, "results": results[:limit],
+        return {"query": q, "results": _strip_internal(results[:limit]),
                 "sources": sorted({r["source"] for r in results}),
                 "cached": True, "tavily": tavily_on, "learned": 0,
                 "backends_queried": 0}
     results: list[dict] = []
     backends = _route_backends(q)
+    # v0.13.1: username discovery untuk query multi-kata — ikut thread pool
+    # yang sama (tetap dalam budget kumpul 2.5 dtk).
+    if len(q.split()) >= 2:
+        backends = [_web_github_discover, *backends]
     # v0.12: jangan tunggu SEMUA backend (backend 5 dtk bisa menahan total
     # jadi >6 dtk). Kumpulkan max 2.5 dtk, ambil yang selesai, batalkan
     # sisanya. backends_queried tetap = jumlah backend yang dicoba.
@@ -2108,7 +2337,7 @@ def web_search(query: str, limit: int = 10) -> dict:
             pass
     _log_event("search", query=q)
     con.close()
-    return {"query": q, "results": uniq[:limit],
+    return {"query": q, "results": _strip_internal(uniq[:limit]),
             "sources": sorted({r["source"] for r in uniq}),
             "cached": False, "tavily": tavily_on, "learned": learned,
             "backends_queried": len(backends)}
