@@ -78,7 +78,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -282,9 +282,16 @@ def _index_file(con: sqlite3.Connection, path: str) -> dict | None:
         return {"doc_id": row[0], "skipped": True, "chunks": 0}
     if row:
         con.execute("DELETE FROM docs WHERE id = ?", (row[0],))
-    fn = os.path.basename(path)
+    # v0.12: title diambil dari baris "# Judul" pertama di isi markdown,
+    # BUKAN nama file. index_document() selalu menulis "# {title}" di baris
+    # pertama, jadi ini konsisten — dan dokumen hasil belajar web tidak lagi
+    # berjudul "web-ddg_lite-....md" (yang bocor ke kotak jawaban).
+    title = os.path.basename(path)
+    m = re.search(r"^\s*#{1,6}\s+(.+?)\s*$", text, re.M)
+    if m:
+        title = m.group(1).strip()[:200] or title
     cur = con.execute(
-        "INSERT INTO docs(path, title, mtime) VALUES (?, ?, ?)", (path, fn, mtime))
+        "INSERT INTO docs(path, title, mtime) VALUES (?, ?, ?)", (path, title, mtime))
     doc_id = cur.lastrowid
     n_chunks = 0
     for i, ch in enumerate(chunk_text(text)):
@@ -604,7 +611,12 @@ def suggest(prefix: str, limit: int = 8) -> dict:
                 if d < best_d:
                     best, best_d = q, d
             if best and best_d <= max(2, len(p) // 4):
-                out["did_you_mean"] = best
+                # v0.12: JANGAN pernah sarankan kandidat yang merupakan substring
+                # dari query user (atau sebaliknya). "Koreksi" yang menghapus /
+                # menambah huruf (mis. "adip lowkey" -> "adip lowke") BUKAN typo,
+                # dan selalu terasa ngaco di mata user.
+                if not (p in best or best in p):
+                    out["did_you_mean"] = best
         con.close()
     except Exception:
         pass
@@ -684,12 +696,30 @@ def related(doc_id: int, limit: int = 5) -> list[dict]:
     return [s for _, s in scored[:limit]]
 
 
+# pola judul dokumen internal yang bocor dari era sebelum v0.12
+# (title = basename file, mis. "web-ddg_lite-....md")
+def _looks_internal_title(title: str) -> bool:
+    t = (title or "").strip().lower()
+    return t.startswith("web-") or t.endswith((".md", ".markdown", ".txt"))
+
+
 def answer(query: str) -> dict:
     hits = search(query, limit=5, log=False)
+    # v0.12 pertahanan lapis kedua: buang hits berjudul internal dari
+    # kandidat jawaban — atribusi sumber tak boleh bocor ke UI.
+    hits = [h for h in hits
+            if not _looks_internal_title(h.get("title") or "")]
     if not hits:
         _log_event("search", query=query)
         return {"query": query, "answer": None, "source": None}
     qtoks = set(_tokens(query)) | set(_get_expansion(query))
+    # v0.12 guard kualitas: untuk query multi-kata, kalimat terpilih harus
+    # mengandung frasa utuh ATAU minimal separuh kata query (ceil, min 1).
+    # Kalau tidak ada yang lolos -> answer None (frontend sembunyikan kotak).
+    gate_toks = _tokens(query)
+    phrase = " ".join(gate_toks)
+    multi = len(gate_toks) > 1
+    needed = max(1, -(-len(gate_toks) // 2))
     best, best_score, best_hit = None, -1, None
     for h in hits:
         con = _connect()
@@ -700,6 +730,12 @@ def answer(query: str) -> dict:
             continue
         for s in _sentences(row[0]):
             toks = set(_tokens(s))
+            if multi:
+                s_low = s.lower()
+                ok = (phrase in s_low) or \
+                    (len(toks & set(gate_toks)) >= needed)
+                if not ok:
+                    continue
             ov = len(toks & qtoks)
             # utama: jumlah overlap; penyeimbang: kalimat utuh > potongan pendek
             score = ov * 1000 + min(len(s), 300)
@@ -795,6 +831,9 @@ def reindex_full() -> dict:
 
 WEB_UA = {"User-Agent": "CARI/0.9 (personal search engine; +https://adiprmx.github.io/cari/)"}
 WEB_TIMEOUT = 5
+# v0.12: batas kumpul hasil backend per query — jangan tunggu backend yang
+# lambat; ambil yang sudah selesai, sisanya dibatalkan. Target total <3 dtk.
+WEB_COLLECT_TIMEOUT = 2.5
 WEB_CACHE_TTL = 24 * 3600  # detik — hasil web mentah di-cache 1 hari
 
 SCHEMA_WEB = """
@@ -1248,23 +1287,72 @@ def _web_slug(url: str) -> str:
     return s[:80] or "doc"
 
 
-def _web_rank(query: str, results: list[dict]) -> list[dict]:
-    """Re-rank: hitung kemunculan kata (judul 3x bobot snippet) + bonus
-    frasa utuh di judul. Menghindari seri massal di query 1 kata."""
-    toks = [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
-    phrase = " ".join(toks)
+# v0.12: bobot kepercayaan sumber — wikipedia/wikidata/github sedikit di
+# atas, npm sedikit di bawah (netral = 1.0).
+_SOURCE_TRUST = {
+    "wikipedia": 1.25, "wikidata": 1.20, "github": 1.20,
+    "brave": 1.15, "duckduckgo": 1.10, "openalex": 1.10, "arxiv": 1.10,
+    "pubmed": 1.10, "stackexchange": 1.10, "hackernews": 1.10,
+    "ddg_lite": 1.00, "qwant": 1.00, "openlibrary": 1.00, "archive": 1.00,
+    "npm": 0.90,
+}
 
-    def score(r: dict) -> int:
+
+def _web_rank(query: str, results: list[dict]) -> list[dict]:
+    """v0.12 re-rank presisi:
+
+    1. whole-word match di judul >> substring di dalam kata lain
+       ("lowkey" di "@devlowkey/..." hampir tak dihitung, whole-word dihitung
+       besar). Judul berbobot jauh lebih dari snippet.
+    2. Exact phrase query di judul = bonus besar.
+    3. Coverage: berapa kata query yang cocok. Skor dikalikan
+       (0.3 + 0.7*coverage) — hasil yang cocok SEMUA kata menang telak atas
+       yang cuma cocok sebagian.
+    4. Query multi-kata dengan coverage 0 (tak ada kata cocok) DIBUANG.
+    5. Bobot kepercayaan sumber (_SOURCE_TRUST).
+    Recall query 1 kata dipertahankan: token tunggal yang cocok whole-word
+    tetap menang (mis. "adiprmx" -> profil GitHub #1)."""
+    toks = [t for t in _tokens(query) if t not in STOPWORDS] or _tokens(query)
+    if not toks:
+        return list(results)  # tak ada token berarti -> urutan backend saja
+    phrase = " ".join(toks)
+    multi = len(toks) > 1
+    patterns = {t: re.compile(r"\b" + re.escape(t) + r"\b") for t in toks}
+
+    def score(r: dict) -> float | None:
         title = (r.get("title") or "").lower()
         snip = (r.get("snippet") or "").lower()
-        s = 0
+        matched = 0
+        s = 0.0
         for t in toks:
-            s += 3 * title.count(t) + snip.count(t)
-        if phrase and phrase in title:
-            s += 5
+            pat = patterns[t]
+            wt = len(pat.findall(title))          # whole-word di judul
+            ws = len(pat.findall(snip))           # whole-word di snippet
+            st = title.count(t) - wt              # substring saja di judul
+            ss = snip.count(t) - ws               # substring saja di snippet
+            if wt or ws:
+                matched += 1
+            s += (4.0 * min(wt, 3) + 2.0 * min(ws, 3)
+                  + 0.2 * min(st, 5) + 0.1 * min(ss, 5))
+        coverage = matched / len(toks)
+        if multi and matched == 0:
+            return None  # buang: tak ada satu kata pun yang benar-benar cocok
+        if len(phrase) > 3:
+            if phrase in title:
+                s += 60.0
+            elif phrase in snip:
+                s += 20.0
+        s *= (0.3 + 0.7 * coverage)
+        s *= _SOURCE_TRUST.get(r.get("source") or "", 1.0)
         return s
 
-    return sorted(results, key=score, reverse=True)
+    scored = []
+    for r in results:
+        s = score(r)
+        if s is not None and s > 0:
+            scored.append((s, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored]
 
 
 def _route_backends(query: str) -> list:
@@ -1365,13 +1453,24 @@ def web_search(query: str, limit: int = 10) -> dict:
                 "backends_queried": 0}
     results: list[dict] = []
     backends = _route_backends(q)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(backends)) as ex:
+    # v0.12: jangan tunggu SEMUA backend (backend 5 dtk bisa menahan total
+    # jadi >6 dtk). Kumpulkan max 2.5 dtk, ambil yang selesai, batalkan
+    # sisanya. backends_queried tetap = jumlah backend yang dicoba.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(backends))
+    try:
         futs = [ex.submit(fn, q) for fn in backends]
-        for f in concurrent.futures.as_completed(futs):
+        done, _pending = concurrent.futures.wait(
+            futs, timeout=WEB_COLLECT_TIMEOUT)
+        for f in done:
             try:
                 results.extend(f.result() or [])
             except Exception:
                 pass
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python < 3.9
+            ex.shutdown(wait=False)
     seen, uniq = set(), []
     for r in results:
         u = (r.get("url") or "").rstrip("/")
