@@ -1,4 +1,4 @@
-"""CARI Server v0.7 "Belajar Sendiri" — 100% stdlib, tanpa pip install.
+"""CARI Server v0.8 "Web Mode" — 100% stdlib, tanpa pip install.
 
 Mesin pencari yang belajar sendiri:
   Pilar 1 — Belajar dari pengguna (learning to rank, 100% lokal):
@@ -23,6 +23,16 @@ Mesin pencari yang belajar sendiri:
     POST /reindex untuk rebuild penuh manual, POST /learn untuk
     "belajar ulang" dari seluruh event klik (dipanggil via scheduled task
     harian: curl -X POST -H "X-API-Key: ..." https://.../learn).
+  Pilar 4 — Web Mode / metasearch (v0.8):
+    * GET /web/search?q=... : cari di web lewat backend resmi tanpa API key
+      (Wikipedia API + DuckDuckGo Instant Answer — keduanya lolos whitelist
+      outbound PythonAnywhere gratis).
+    * Setiap hasil web OTOMATIS di-index permanen ke database lokal
+      (path web/<sumber>/<slug>) -> index tumbuh dari pencarianmu:
+      mesin yang benar-benar belajar sendiri.
+    * Hasil mentah di-cache 24 jam (tabel web_cache).
+    * Siap Brave Search API: cukup set env BRAVE_API_KEY di WSGI config,
+      backend brave ikut dipakai (perlu api.search.brave.com di-whitelist).
 
 Deploy sama seperti v0.6: upload file ini ke ~/cari-server, WSGI config:
     import os, sys
@@ -34,8 +44,10 @@ Deploy sama seperti v0.6: upload file ini ke ~/cari-server, WSGI config:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
+import html as htmlmod
 import json
 import math
 import os
@@ -45,7 +57,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 ENGINE_NAME = "local"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -739,6 +751,170 @@ def reindex_full() -> dict:
     return build_index()
 
 
+# ------------------------------------------------------------- v0.8 Web Mode (metasearch)
+# CARI jadi metasearch: narik hasil dari backend web resmi (tanpa API key),
+# lalu setiap hasil OTOMATIS di-index permanen ke database lokal -> index
+# tumbuh dari pencarianmu (mesin yang benar-benar belajar sendiri).
+# Siap Brave Search API: set env BRAVE_API_KEY -> backend brave ikut dipakai
+# (perlu api.search.brave.com lolos whitelist outbound).
+
+WEB_UA = {"User-Agent": "CARI/0.8 (personal search engine; +https://adiprmx.github.io/cari/)"}
+WEB_TIMEOUT = 10
+WEB_CACHE_TTL = 24 * 3600  # detik — hasil web mentah di-cache 1 hari
+
+SCHEMA_WEB = """
+CREATE TABLE IF NOT EXISTS web_cache (
+    q            TEXT PRIMARY KEY,
+    results_json TEXT NOT NULL,
+    ts           REAL NOT NULL
+);
+"""
+
+
+def _http_get_json(url: str, headers: dict | None = None,
+                   timeout: int = WEB_TIMEOUT) -> dict:
+    h = dict(WEB_UA)
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _web_wikipedia(query: str) -> list[dict]:
+    """Wikipedia API (id -> fallback en). Resmi, tanpa key."""
+    out: list[dict] = []
+    for lang in ("id", "en"):
+        try:
+            u = f"https://{lang}.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
+                "action": "query", "list": "search", "srsearch": query,
+                "srlimit": 8, "format": "json", "formatversion": "2"})
+            d = _http_get_json(u)
+            for it in d.get("query", {}).get("search", []):
+                title = it.get("title", "")
+                url = (f"https://{lang}.wikipedia.org/wiki/"
+                       + urllib.parse.quote(title.replace(" ", "_")))
+                snip = htmlmod.unescape(re.sub(r"<[^>]+>", "", it.get("snippet", "")))
+                out.append({"title": title, "url": url, "snippet": snip.strip(),
+                            "source": "wikipedia"})
+            if out:
+                break
+        except Exception:
+            continue
+    return out
+
+
+def _web_duckduckgo(query: str) -> list[dict]:
+    """DuckDuckGo Instant Answer API. Resmi, tanpa key."""
+    out: list[dict] = []
+    try:
+        u = "https://api.duckduckgo.com/?" + urllib.parse.urlencode(
+            {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+        d = _http_get_json(u)
+
+        def walk(topics):
+            for t in topics:
+                if "Topics" in t:
+                    walk(t["Topics"])
+                elif t.get("FirstURL"):
+                    txt = t.get("Text", "")
+                    out.append({
+                        "title": (txt.split(" - ")[0].strip()[:90] or t["FirstURL"]),
+                        "url": t["FirstURL"],
+                        "snippet": txt,
+                        "source": "duckduckgo"})
+
+        if d.get("AbstractURL") and d.get("AbstractText"):
+            out.append({"title": d.get("Heading") or query,
+                        "url": d["AbstractURL"],
+                        "snippet": d["AbstractText"],
+                        "source": "duckduckgo"})
+        walk(d.get("RelatedTopics", []))
+    except Exception:
+        pass
+    return out[:12]
+
+
+def _web_brave(query: str) -> list[dict]:
+    """Brave Search API — aktif kalau env BRAVE_API_KEY di-set."""
+    key = os.environ.get("BRAVE_API_KEY", "").strip()
+    if not key:
+        return []
+    try:
+        u = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(
+            {"q": query, "count": 10, "search_lang": "id", "safesearch": "moderate"})
+        d = _http_get_json(u, headers={"X-Subscription-Token": key,
+                                       "Accept": "application/json"})
+        return [{"title": r.get("title", ""), "url": r.get("url", ""),
+                 "snippet": r.get("description", ""), "source": "brave"}
+                for r in d.get("web", {}).get("results", []) if r.get("url")]
+    except Exception:
+        return []
+
+
+def _web_slug(url: str) -> str:
+    s = re.sub(r"^https?://(www\.)?", "", url.strip().lower())
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:80] or "doc"
+
+
+def web_search(query: str, limit: int = 10) -> dict:
+    q = query.strip()
+    qn = q.lower()
+    brave_on = bool(os.environ.get("BRAVE_API_KEY", "").strip())
+    con = _connect()
+    con.executescript(SCHEMA_WEB)
+    row = con.execute("SELECT results_json, ts FROM web_cache WHERE q = ?", (qn,)).fetchone()
+    now = time.time()
+    if row and now - row[1] < WEB_CACHE_TTL:
+        con.close()
+        results = json.loads(row[0])
+        _log_event("search", query=q)
+        return {"query": q, "results": results[:limit],
+                "sources": sorted({r["source"] for r in results}),
+                "cached": True, "brave": brave_on, "learned": 0}
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(_web_wikipedia, q), ex.submit(_web_duckduckgo, q),
+                ex.submit(_web_brave, q)]
+        for f in concurrent.futures.as_completed(futs):
+            try:
+                results.extend(f.result() or [])
+            except Exception:
+                pass
+    seen, uniq = set(), []
+    for r in results:
+        u = (r.get("url") or "").rstrip("/")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+    uniq = uniq[:max(limit * 2, 20)]
+    con.execute("INSERT OR REPLACE INTO web_cache(q, results_json, ts) VALUES (?,?,?)",
+                (qn, json.dumps(uniq, ensure_ascii=False), now))
+    con.commit()
+    # --- belajar: index permanen ke database lokal (skip kalau sudah ada) ---
+    learned = 0
+    for r in uniq:
+        doc_id = f"web-{r['source']}-{_web_slug(r['url'])}"
+        fname = "".join(c if (c.isalnum() or c in "-_") else "_" for c in doc_id)[:80]
+        exists = con.execute(
+            "SELECT 1 FROM docs WHERE path = ?",
+            (os.path.join(DATA_DIR, fname + ".md"),)).fetchone()
+        if exists:
+            continue
+        try:
+            index_document(doc_id, r["title"] or doc_id,
+                           f"Sumber: {r['url']}\n\n{r['snippet']}")
+            learned += 1
+        except Exception:
+            pass
+    _log_event("search", query=q)
+    con.close()
+    return {"query": q, "results": uniq[:limit],
+            "sources": sorted({r["source"] for r in uniq}),
+            "cached": False, "brave": brave_on, "learned": learned}
+
+
 # ------------------------------------------------------------- WSGI app
 CORS = [
     ("Access-Control-Allow-Origin", "*"),
@@ -795,7 +971,10 @@ def application(environ, start_response):
 
     if path == "/health" and method == "GET":
         return _json(start_response, "OK",
-                     {"status": "ok", "version": VERSION, "engine": ENGINE_NAME})
+                     {"status": "ok", "version": VERSION, "engine": ENGINE_NAME,
+                      "web": True,
+                      "web_sources": ["wikipedia", "duckduckgo"]
+                      + (["brave"] if os.environ.get("BRAVE_API_KEY", "").strip() else [])})
 
     if path == "/ready" and method == "GET":
         return _json(start_response, "OK", {"ready": True, "engine": ENGINE_NAME})
@@ -822,6 +1001,23 @@ def application(environ, start_response):
                          {"detail": f"Pencarian gagal: {e}"}, 502)
         return _json(start_response, "OK",
                      {"query": q, "engine": ENGINE_NAME, "count": len(hits), "hits": hits})
+
+    # --- v0.8 Web Mode (metasearch + belajar otomatis) ---
+    if path == "/web/search" and method == "GET":
+        qp = _query_params(environ)
+        q = qp.get("q", "").strip()
+        if not q:
+            return _json(start_response, "Bad Request",
+                         {"detail": "parameter q wajib diisi"}, 400)
+        try:
+            limit = max(1, min(int(qp.get("limit", "10")), 20))
+        except (TypeError, ValueError):
+            limit = 10
+        try:
+            return _json(start_response, "OK", web_search(q, limit))
+        except Exception as e:
+            return _json(start_response, "Bad Gateway",
+                         {"detail": f"Web search gagal: {e}"}, 502)
 
     if path == "/documents" and method == "POST":
         body = _read_json(environ)
